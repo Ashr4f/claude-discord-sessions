@@ -128,7 +128,9 @@ function normDir(p: string): string {
 // The user's channel convention: lowercase, spaces become dashes, everything
 // else (accents, digits, punctuation Discord accepts) kept as typed.
 function slugify(s: string): string {
-  return s.toLowerCase().trim().replace(/\s+/g, '-')
+  // Spaces and characters Discord rejects in channel names become dashes,
+  // so a session named "UX/UI analyse" maps to #ux-ui-analyse.
+  return s.toLowerCase().trim().replace(/[\s\/\\#@:*?"<>|]+/g, '-').replace(/-{2,}/g, '-').replace(/^-+|-+$/g, '')
 }
 
 // The session's project directory. The server runs with --cwd at the plugin
