@@ -1,0 +1,14 @@
+{
+  "name": "claude-discord-sessions",
+  "owner": {
+    "name": "Ashraf Ahmed",
+    "url": "https://github.com/Ashr4f"
+  },
+  "plugins": [
+    {
+      "name": "discord-sessions",
+      "source": "./plugins/discord-sessions",
+      "description": "Talk to each Claude Code session in its own Discord channel: session name = channel name, in-channel permission buttons, clickable questions with forms."
+    }
+  ]
+}

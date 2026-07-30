@@ -1,0 +1,10 @@
+claude-discord-sessions
+
+This product includes software developed by Anthropic, PBC: the Discord
+channel plugin for Claude Code (claude-plugins-official), licensed under the
+Apache License 2.0.
+
+Modifications (per-session channel routing, in-channel permission prompts,
+the ask_user clickable-questions tool, session-PID mapping) are fenced with
+"LOCAL PATCH" comment markers in server.ts and are also licensed under the
+Apache License 2.0.

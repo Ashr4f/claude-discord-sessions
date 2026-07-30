@@ -1,0 +1,11 @@
+{
+  "name": "discord-sessions",
+  "version": "1.0.0",
+  "description": "One Discord channel per Claude Code session. Rename a session and it talks in the matching channel; permission prompts and multiple-choice questions become clickable buttons and forms in that channel.",
+  "author": {
+    "name": "Ashraf Ahmed",
+    "url": "https://github.com/Ashr4f"
+  },
+  "homepage": "https://github.com/Ashr4f/claude-discord-sessions",
+  "license": "Apache-2.0"
+}
