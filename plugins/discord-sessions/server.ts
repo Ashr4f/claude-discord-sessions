@@ -1481,10 +1481,44 @@ client.on('messageCreate', msg => {
   handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
 })
 
+// ── startup replay buffer ──────────────────────────────────────────────────
+// The bot shows online as soon as the gateway connects, a few seconds before
+// the session identifies itself and binds its channel. A message typed in
+// that window would be gated out and lost. Buffer early drops and replay the
+// ones addressed to the channel we eventually bind.
+const EARLY_WINDOW_MS = 3 * 60 * 1000
+const startedAt = Date.now()
+const earlyDropped: Message[] = []
+
+function bufferEarlyDrop(msg: Message): void {
+  if (!ROUTING || Date.now() - startedAt > EARLY_WINDOW_MS) return
+  if (msg.channel.type === ChannelType.DM) return
+  earlyDropped.push(msg)
+  if (earlyDropped.length > 25) earlyDropped.shift()
+}
+
+function replayEarlyDrops(): void {
+  if (!boundChannelId || earlyDropped.length === 0) return
+  const mine = earlyDropped.filter(m => {
+    const cid = m.channel.isThread() ? m.channel.parentId ?? m.channelId : m.channelId
+    return cid === boundChannelId
+  })
+  for (const m of mine) {
+    const i = earlyDropped.indexOf(m)
+    if (i >= 0) earlyDropped.splice(i, 1)
+    process.stderr.write(`discord channel: replaying early message ${m.id}\n`)
+    void handleInbound(m).catch(() => {})
+  }
+}
+// ── end startup replay buffer ───────────────────────────────────────────────
+
 async function handleInbound(msg: Message): Promise<void> {
   const result = await gate(msg)
 
-  if (result.action === 'drop') return
+  if (result.action === 'drop') {
+    bufferEarlyDrop(msg)
+    return
+  }
 
   if (result.action === 'pair') {
     const lead = result.isResend ? 'Still pending' : 'Pairing required'
@@ -1560,14 +1594,21 @@ async function handleInbound(msg: Message): Promise<void> {
 
 client.once('ready', c => {
   process.stderr.write(`discord channel: gateway connected as ${c.user.tag}\n`)
-  // LOCAL PATCH: resolve this session's channel once the gateway is up, then
-  // re-check every 30s — picks up late hook writes and /rename mid-session.
-  const rebind = () =>
-    void bindSessionChannel().catch(err =>
-      process.stderr.write(`discord channel: channel binding failed: ${err}\n`),
-    )
-  rebind()
-  setInterval(rebind, 30_000).unref()
+  // Resolve this session's channel once the gateway is up. The session-map
+  // hook and the first transcript write race the gateway, so rebind every 2s
+  // until the binding comes from the session title (or a minute passes),
+  // then settle into the 30s cadence that picks up /rename mid-session.
+  const rebind = async () => {
+    try {
+      await bindSessionChannel()
+    } catch (err) {
+      process.stderr.write(`discord channel: channel binding failed: ${err}\n`)
+    }
+    const settled = wantSource === 'title' || wantSource === 'env' || Date.now() - startedAt > 60_000
+    const t = setTimeout(rebind, settled ? 30_000 : 2_000)
+    ;(t as any).unref?.()
+  }
+  void rebind()
 })
 
 client.login(TOKEN).catch(err => {
