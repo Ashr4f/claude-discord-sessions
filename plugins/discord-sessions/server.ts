@@ -468,7 +468,7 @@ function noteSent(id: string): void {
 // either done or waiting on the user). Hard cap in case the session
 // finishes its turn without sending anything.
 const typingTimers = new Map<string, ReturnType<typeof setInterval>>()
-const TYPING_MAX_MS = 5 * 60 * 1000
+const TYPING_MAX_MS = 90 * 1000
 
 function stopTyping(channelId: string | null): void {
   if (!channelId) return
@@ -740,6 +740,8 @@ const mcp = new Server(
       'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
+      '',
+      'Every delivered channel message starts a typing indicator that only your reply or a reaction stops. Never end a turn without responding on Discord to a delivered message: when no reply is warranted (a bare "ok", a thanks), acknowledge with the react tool (e.g. 👍) instead of staying silent.',
       '',
       "fetch_messages pulls real Discord history. Discord's search API isn't available to bots — if the user asks you to find an old message, fetch more history or ask them roughly when it was.",
       '',
@@ -1233,6 +1235,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const ch = await fetchAllowedChannel(args.chat_id as string)
         const msg = await ch.messages.fetch(args.message_id as string)
         await msg.react(args.emoji as string)
+        stopTyping(args.chat_id as string)
         return { content: [{ type: 'text', text: 'reacted' }] }
       }
       case 'edit_message': {
