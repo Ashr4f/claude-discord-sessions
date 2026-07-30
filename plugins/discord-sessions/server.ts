@@ -1076,6 +1076,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const guilds = ROUTING.guildId
           ? [await client.guilds.fetch(ROUTING.guildId)]
           : [...client.guilds.cache.values()]
+        // If the session's own name no longer matches the channel, nothing
+        // can rename a Claude session from outside — /rename is terminal-only.
+        // Best effort: tell the user the exact command to sync the names.
+        const renameTip = async (chName: string): Promise<string> => {
+          sessionInfo ??= findSessionInfo()
+          const title = sessionInfo ? await readSessionTitle(sessionInfo) : null
+          if (title && slugify(title) === chName) return ''
+          return `\n💡 To keep the session name in sync, run \`/rename ${chName}\` in this session's terminal.`
+        }
         for (const g of guilds) {
           const chs = await g.channels.fetch()
           const hit = [...chs.values()].find(
@@ -1086,8 +1095,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             boundChannelName = hit.name
             manualBind = true
             process.stderr.write(`discord channel: rebound to #${hit.name}\n`)
+            const tip = await renameTip(hit.name)
+            if (tip && 'send' in hit) void (hit as any).send(tip.trim()).catch(() => {})
             return {
-              content: [{ type: 'text', text: `bound to #${hit.name} (id: ${hit.id}) — Discord chat for this session now lives there` }],
+              content: [{ type: 'text', text: `bound to #${hit.name} (id: ${hit.id}) — Discord chat for this session now lives there${tip}` }],
             }
           }
         }
@@ -1101,8 +1112,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           boundChannelName = created.name
           manualBind = true
           process.stderr.write(`discord channel: created and bound #${created.name}\n`)
+          const tip = await renameTip(created.name)
+          if (tip) void created.send(tip.trim()).catch(() => {})
           return {
-            content: [{ type: 'text', text: `created #${created.name} (id: ${created.id}) and bound this session to it` }],
+            content: [{ type: 'text', text: `created #${created.name} (id: ${created.id}) and bound this session to it${tip}` }],
           }
         }
         throw new Error(`no guild text channel named "${wanted}" — create it in Discord first, pass create: true if the user wants it created, or use the fallback #${ROUTING.fallback ?? 'general'}`)
