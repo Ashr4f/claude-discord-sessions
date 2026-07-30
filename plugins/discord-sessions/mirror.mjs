@@ -59,7 +59,7 @@ try {
 }
 
 const texts = []
-let sawDiscordSend = false
+const discordSentTexts = []
 let fromDiscord = false
 for (let i = lines.length - 1; i >= 0; i--) {
   let rec
@@ -75,8 +75,8 @@ for (let i = lines.length - 1; i >= 0; i--) {
       (Array.isArray(c) && c.some(b => b.type === 'text') && !c.some(b => b.type === 'tool_result'))
     if (isReal) {
       // Surface separation: only Discord-originated turns get mirrored, as a
-      // safety net when the model forgot to reply there. Terminal turns stay
-      // in the terminal.
+      // safety net for anything the model wrote in the terminal but did not
+      // send to the channel. Terminal turns stay in the terminal.
       const txt = typeof c === 'string' ? c : c.filter(b => b.type === 'text').map(b => b.text).join('\n')
       fromDiscord = /<channel[^>]*source="(plugin:)?discord/.test(txt)
       break
@@ -86,15 +86,25 @@ for (let i = lines.length - 1; i >= 0; i--) {
   if (rec.type !== 'assistant') continue
   for (const block of rec.message?.content ?? []) {
     if (block.type === 'text' && block.text?.trim()) texts.unshift(block.text.trim())
-    if (block.type === 'tool_use' && /discord.*(reply|ask_user|edit_message|react)$/.test(block.name ?? '')) {
-      sawDiscordSend = true
+    if (block.type === 'tool_use' && /discord.*(reply|ask_user)$/.test(block.name ?? '')) {
+      discordSentTexts.push(String(block.input?.text ?? block.input?.intro ?? ''))
     }
   }
 }
-if (!fromDiscord || sawDiscordSend || texts.length === 0) process.exit(0)
+if (!fromDiscord || texts.length === 0) process.exit(0)
 
-const content = texts.join('\n\n')
-if (!content.trim() || /^Replied on Discord\.?$/i.test(content.trim())) process.exit(0)
+// A reply during the turn no longer skips the whole mirror: interim
+// narration between tool calls was landing only in the terminal. Mirror
+// every block Discord did not get; a block counts as sent when its start
+// appears in one of the turn's replies.
+const sentBlob = discordSentTexts.join('\n')
+const missing = texts.filter(t => {
+  if (/^Replied on Discord\.?$/i.test(t)) return false
+  return !(t.length >= 20 && sentBlob.includes(t.slice(0, 80)))
+})
+if (missing.length === 0) process.exit(0)
+const content = missing.join('\n\n')
+if (!content.trim()) process.exit(0)
 
 const api = async (path, init) => {
   const res = await fetch(`https://discord.com/api/v10${path}`, {
