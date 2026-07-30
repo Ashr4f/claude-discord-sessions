@@ -223,20 +223,34 @@ async function readSessionTitle(info: SessionInfo): Promise<string | null> {
   return null
 }
 
+// Where the wanted name came from — folder-name guesses are too weak to
+// justify offering channel creation (a session in ~ would offer "#ashra").
+let wantSource: 'env' | 'title' | 'map' | 'dir' | null = null
+
 async function resolveWantedChannel(): Promise<string | null> {
-  if (process.env.DISCORD_CHANNEL) return process.env.DISCORD_CHANNEL
+  if (process.env.DISCORD_CHANNEL) {
+    wantSource = 'env'
+    return process.env.DISCORD_CHANNEL
+  }
   sessionInfo ??= findSessionInfo()
   if (sessionInfo) {
     const title = await readSessionTitle(sessionInfo)
-    if (title) return slugify(title)
+    if (title) {
+      wantSource = 'title'
+      return slugify(title)
+    }
   }
   const dir = normDir(SESSION_DIR)
   // If cwd wasn't inherited (still the plugin root), the session can't be
   // identified by directory either — bind the fallback channel.
-  if (dir === normDir(import.meta.dir)) return null
+  if (dir === normDir(import.meta.dir)) {
+    wantSource = null
+    return null
+  }
   const mapped = Object.entries(ROUTING?.map ?? {}).find(
     ([k]) => normDir(k) === dir,
   )?.[1]
+  wantSource = mapped ? 'map' : 'dir'
   return mapped ?? slugify(dir.split('/').pop() ?? '')
 }
 
@@ -279,7 +293,9 @@ async function bindSessionChannel(): Promise<void> {
       [...chs.values()].find(c => c != null && c.type === ChannelType.GuildText && c.name === n)
     const wantedHit = want ? byName(want) : undefined
     const fallbackHit = byName(fallback)
-    if (want && !wantedHit && fallbackHit && 'send' in fallbackHit) {
+    // Offer creation only for names the user actually chose (session title,
+    // map entry, env var) — never for folder-name guesses.
+    if (want && !wantedHit && fallbackHit && 'send' in fallbackHit && wantSource !== 'dir') {
       void offerChannelCreation(g.id, want, fallbackHit as any)
     }
     const hit = wantedHit ?? fallbackHit

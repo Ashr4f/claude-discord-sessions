@@ -90,13 +90,17 @@ function nameOf(pid) {
 
 // Walk up from this hook process. Stop once the Claude process itself is
 // written: going further would stomp files of sessions sharing the same
-// terminal ancestor. (Self is node too, so the stop check skips index 0.)
+// terminal ancestor. Only a process actually named claude* counts as the
+// stop point — Claude Code spawns hooks through transient node wrappers, so
+// stopping at any node/bun ancestor ends the walk too early and the real
+// Claude pid never gets written. If Claude runs under plain node (npm
+// installs), no name matches and we simply write all 8 levels.
 let p = process.pid
 for (let i = 0; i < 8 && p > 1; i++) {
   try {
     writeFileSync(join(dir, `${p}.json`), payload)
   } catch {}
-  if (i > 0 && /^(claude|node|bun)/i.test(nameOf(p))) break
+  if (i > 0 && /^claude/i.test(nameOf(p))) break
   const next = ppidOf(p)
   if (!Number.isFinite(next) || next === p) break
   p = next
