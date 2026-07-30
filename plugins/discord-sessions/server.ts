@@ -240,6 +240,31 @@ async function resolveWantedChannel(): Promise<string | null> {
   return mapped ?? slugify(dir.split('/').pop() ?? '')
 }
 
+// When the wanted channel doesn't exist, offer (once per name) to create it
+// via buttons in the fallback channel. Clicks are gated like everything else.
+const offeredChannels = new Set<string>()
+const pendingChanOffers = new Map<string, { name: string; guildId: string }>()
+
+async function offerChannelCreation(guildId: string, name: string, fallbackCh: { name: string; send: Function }): Promise<void> {
+  if (offeredChannels.has(name)) return
+  offeredChannels.add(name)
+  const id = randomBytes(4).toString('hex')
+  pendingChanOffers.set(id, { name, guildId })
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(`chan:create:${id}`).setLabel(`Create #${name}`).setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`chan:skip:${id}`).setLabel('Not now').setStyle(ButtonStyle.Secondary),
+  )
+  try {
+    const sent = await fallbackCh.send({
+      content: `This session wants **#${name}**, but that channel doesn't exist — answering in #${fallbackCh.name} for now. Create it and bind the session to it?`,
+      components: [row],
+    })
+    noteSent(sent.id)
+  } catch (err) {
+    process.stderr.write(`discord channel: channel-creation offer failed: ${err}\n`)
+  }
+}
+
 async function bindSessionChannel(): Promise<void> {
   if (!ROUTING || manualBind) return
   const want = await resolveWantedChannel()
@@ -252,7 +277,12 @@ async function bindSessionChannel(): Promise<void> {
     const chs = await g.channels.fetch()
     const byName = (n: string) =>
       [...chs.values()].find(c => c != null && c.type === ChannelType.GuildText && c.name === n)
-    const hit = (want ? byName(want) : undefined) ?? byName(fallback)
+    const wantedHit = want ? byName(want) : undefined
+    const fallbackHit = byName(fallback)
+    if (want && !wantedHit && fallbackHit && 'send' in fallbackHit) {
+      void offerChannelCreation(g.id, want, fallbackHit as any)
+    }
+    const hit = wantedHit ?? fallbackHit
     if (hit && hit.id !== boundChannelId) {
       boundChannelId = hit.id
       boundChannelName = hit.name
@@ -853,11 +883,12 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'bind_channel',
       description:
-        'Bind this Claude session to a guild text channel by name (e.g. "library-ssr"). All Discord conversation for this session then happens in that channel. Use when the user says this session should talk in a specific channel.',
+        'Bind this Claude session to a guild text channel by name (e.g. "library-ssr"). All Discord conversation for this session then happens in that channel. Use when the user says this session should talk in a specific channel. Binding does not rename the session. If the channel does not exist, pass create: true (only when the user asked for it).',
       inputSchema: {
         type: 'object',
         properties: {
           channel: { type: 'string', description: 'Channel name (without #) or channel ID.' },
+          create: { type: 'boolean', description: 'Create the channel if it does not exist (requires the Manage Channels bot permission).' },
         },
         required: ['channel'],
       },
@@ -1060,7 +1091,21 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             }
           }
         }
-        throw new Error(`no guild text channel named "${wanted}" — create it in Discord first, or use the fallback #${ROUTING.fallback ?? 'general'}`)
+        if (args.create) {
+          const g = ROUTING.guildId
+            ? await client.guilds.fetch(ROUTING.guildId)
+            : [...client.guilds.cache.values()][0]
+          if (!g) throw new Error('no guild available to create the channel in')
+          const created = await g.channels.create({ name: wanted, type: ChannelType.GuildText })
+          boundChannelId = created.id
+          boundChannelName = created.name
+          manualBind = true
+          process.stderr.write(`discord channel: created and bound #${created.name}\n`)
+          return {
+            content: [{ type: 'text', text: `created #${created.name} (id: ${created.id}) and bound this session to it` }],
+          }
+        }
+        throw new Error(`no guild text channel named "${wanted}" — create it in Discord first, pass create: true if the user wants it created, or use the fallback #${ROUTING.fallback ?? 'general'}`)
       }
       case 'fetch_messages': {
         const ch = await fetchAllowedChannel(args.channel as string)
@@ -1218,6 +1263,46 @@ client.on('interactionCreate', async (interaction: Interaction) => {
     await interaction.reply({ content: `➡️ ${answer}` }).catch(() => {})
     deliverAnswer(answer, interaction.channelId ?? boundChannelId ?? '', (interaction as any).message?.id ?? '', interaction.user)
     return
+  }
+})
+
+// LOCAL PATCH: channel-creation offer buttons. Same gates as everything
+// else: paired account only, owner instance only.
+client.on('interactionCreate', async (interaction: Interaction) => {
+  if (!interaction.isButton()) return
+  const m = /^chan:(create|skip):([0-9a-f]{8})$/.exec(interaction.customId)
+  if (!m) return
+  const access = loadAccess()
+  if (!access.allowFrom.includes(interaction.user.id)) {
+    await interaction.reply({ content: 'Not authorized.', ephemeral: true }).catch(() => {})
+    return
+  }
+  const [, kind, offerId] = m
+  const offer = pendingChanOffers.get(offerId)
+  if (!offer) return
+  pendingChanOffers.delete(offerId)
+
+  if (kind === 'skip') {
+    await interaction.update({ content: `OK — staying in the fallback channel.`, components: [] }).catch(() => {})
+    return
+  }
+  try {
+    const g = await client.guilds.fetch(offer.guildId)
+    const ch = await g.channels.create({ name: offer.name, type: ChannelType.GuildText })
+    boundChannelId = ch.id
+    boundChannelName = ch.name
+    process.stderr.write(`discord channel: created and bound #${ch.name}\n`)
+    await interaction
+      .update({ content: `✅ **#${ch.name}** created — this session is now bound to it. Talk to it there.`, components: [] })
+      .catch(() => {})
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    await interaction
+      .update({
+        content: `❌ Couldn't create **#${offer.name}**: ${msg}\nGrant the bot the "Manage Channels" permission, or create the channel manually.`,
+        components: [],
+      })
+      .catch(() => {})
   }
 })
 

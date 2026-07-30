@@ -15,6 +15,7 @@ blocks:
 7. Bound-channel permission prompts in the permission_request notification handler (DM fallback)
 8. Owner-only guard on permission button interactions (`pendingPermissions.has` check), otherwise other sessions' instances race the owner
 9. `ask_user` tool: clickable questions (buttons or modal form), answers injected back as inbound channel messages
+10. Channel-creation offer: when a named session finds no matching channel, buttons in the fallback channel create + bind it (`offerChannelCreation` + `chan:` interaction listener + `create` option on `bind_channel`)
 
 Other deltas vs upstream: `.mcp.json` runs `bootstrap.ts` directly (dependency
 bootstrap + preserves the session cwd; upstream's `--cwd` flag hides it),

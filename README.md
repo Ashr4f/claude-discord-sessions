@@ -13,6 +13,7 @@ This is a fork of the official `discord` plugin for Claude Code (Apache-2.0, by 
 - **Permission prompts in the channel** with Allow / Deny / See more buttons (instead of DM spam).
 - **Clickable questions.** Claude asks multiple-choice questions with colored buttons, or a popup form with dropdowns and a free-text field for multi-question cases. You can always type a custom answer instead.
 - **Manual rebinding.** Tell a session "talk in #x" (the `bind_channel` tool), or set `DISCORD_CHANNEL=x` when launching.
+- **Missing channel? One click.** When a named session finds no matching channel, it offers in the fallback channel to create it and bind (needs the Manage Channels bot permission). You can also say "talk in #x, create it".
 
 ## Requirements
 
@@ -25,7 +26,7 @@ This is a fork of the official `discord` plugin for Claude Code (Apache-2.0, by 
 **1. Create your bot** at https://discord.com/developers/applications:
 - New Application, then in the **Bot** tab: Reset Token and copy it (keep it secret), and enable **MESSAGE CONTENT INTENT** (required).
 
-**2. Create a private Discord server** (just for you). Keep `#general`, create one channel per project as needed (lowercase, dashes). Invite the bot: **OAuth2 > URL Generator**, scope `bot`, permissions: View Channels, Send Messages, Read Message History, Add Reactions. Open the generated URL.
+**2. Create a private Discord server** (just for you). Keep `#general`, create one channel per project as needed (lowercase, dashes). Invite the bot: **OAuth2 > URL Generator**, scope `bot`, permissions: View Channels, Send Messages, Read Message History, Add Reactions, Manage Channels (optional, lets the bot create missing session channels for you). Open the generated URL.
 
 **3. Install the plugin** in Claude Code:
 
