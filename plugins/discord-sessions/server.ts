@@ -93,7 +93,7 @@ const client = new Client({
   partials: [Partials.Channel],
 })
 
-// ── LOCAL PATCH: per-session guild channel routing ──────────────────────
+// ── per-session guild channel routing ──────────────────────
 // Each Claude session binds to exactly one guild text channel:
 //   1. DISCORD_CHANNEL env var (per-launch override)
 //   2. channels.json "map" entry matching the session directory
@@ -102,8 +102,7 @@ const client = new Client({
 // When channels.json exists, messages from other channels are dropped and
 // DMs are ignored (set dmMode "on" to keep DM delivery). Delete
 // channels.json to restore stock behavior. Config lives at
-// ~/.claude/channels/discord/channels.json. Backup of this patch:
-// ~/.claude/channels/discord/patches/
+// ~/.claude/channels/discord/channels.json.
 const CHANNELS_FILE = join(STATE_DIR, 'channels.json')
 
 type ChannelRouting = {
@@ -132,7 +131,12 @@ function slugify(s: string): string {
   return s.toLowerCase().trim().replace(/\s+/g, '-')
 }
 
-const SESSION_DIR = process.env.CLAUDE_PROJECT_DIR ?? process.cwd()
+// The session's project directory. The server runs with --cwd at the plugin
+// root, so the reliable source is the SessionStart hook's payload; env and
+// cwd are fallbacks (cwd equal to the plugin root is treated as unknown).
+function sessionDir(): string {
+  return process.env.CLAUDE_PROJECT_DIR ?? sessionInfo?.cwd ?? process.cwd()
+}
 let boundChannelId: string | null = null
 let boundChannelName: string | null = null
 // Set by the bind_channel tool — stops the 30s poll from clobbering a
@@ -240,7 +244,7 @@ async function resolveWantedChannel(): Promise<string | null> {
       return slugify(title)
     }
   }
-  const dir = normDir(SESSION_DIR)
+  const dir = normDir(sessionDir())
   // If cwd wasn't inherited (still the plugin root), the session can't be
   // identified by directory either — bind the fallback channel.
   if (dir === normDir(import.meta.dir)) {
@@ -303,7 +307,7 @@ async function bindSessionChannel(): Promise<void> {
       boundChannelId = hit.id
       boundChannelName = hit.name
       const line =
-        `discord channel: session ${sessionInfo?.sessionId ?? SESSION_DIR} bound to #${hit.name}` +
+        `discord channel: session ${sessionInfo?.sessionId ?? sessionDir()} bound to #${hit.name}` +
         ` (wanted: ${want ?? `fallback ${fallback}`})`
       process.stderr.write(line + '\n')
       // Claude Code drops MCP stderr unless the connection fails, so also
@@ -315,7 +319,7 @@ async function bindSessionChannel(): Promise<void> {
     if (hit) break
   }
 }
-// ── END LOCAL PATCH ──────────────────────────────────────────────────────
+// ── end ──────────────────────────────────────────────────────
 
 type PendingEntry = {
   senderId: string
@@ -445,6 +449,11 @@ type GateResult =
   | { action: 'drop' }
   | { action: 'pair'; code: string; isResend: boolean }
 
+// DM channel id -> human user id, learned from inbound messages. DMChannel
+// objects from the gateway often carry a null recipientId, so the outbound
+// gate falls back to this.
+const dmChannelUsers = new Map<string, string>()
+
 // Track message IDs we recently sent, so reply-to-bot in guild channels
 // counts as a mention without needing fetchReference().
 const recentSentIds = new Set<string>()
@@ -459,6 +468,36 @@ function noteSent(id: string): void {
   }
 }
 
+// ── persistent typing indicator ─────────────────────────────
+// Discord's sendTyping lasts ~10s. Refresh it while the session is working
+// on a delivered message, and stop as soon as we post anything to the
+// channel (a reply, a question, a permission prompt — at that point we're
+// either done or waiting on the user). Hard cap in case the session
+// finishes its turn without sending anything.
+const typingTimers = new Map<string, ReturnType<typeof setInterval>>()
+const TYPING_MAX_MS = 5 * 60 * 1000
+
+function stopTyping(channelId: string | null): void {
+  if (!channelId) return
+  const t = typingTimers.get(channelId)
+  if (t) clearInterval(t)
+  typingTimers.delete(channelId)
+}
+
+function startTyping(ch: unknown, channelId: string): void {
+  stopTyping(channelId)
+  if (!ch || typeof (ch as any).sendTyping !== 'function') return
+  void (ch as any).sendTyping().catch(() => {})
+  const started = Date.now()
+  const timer = setInterval(() => {
+    if (Date.now() - started > TYPING_MAX_MS) return stopTyping(channelId)
+    void (ch as any).sendTyping().catch(() => {})
+  }, 8000)
+  ;(timer as any).unref?.()
+  typingTimers.set(channelId, timer)
+}
+// ── end ──────────────────────────────────────────────────────
+
 async function gate(msg: Message): Promise<GateResult> {
   const access = loadAccess()
   const pruned = pruneExpired(access)
@@ -470,7 +509,7 @@ async function gate(msg: Message): Promise<GateResult> {
   const isDM = msg.channel.type === ChannelType.DM
 
   if (isDM) {
-    // LOCAL PATCH: routing active — sessions live in guild channels, DMs
+    // routing active — sessions live in guild channels, DMs
     // are not delivered (permission buttons still work via interactionCreate).
     if (ROUTING && ROUTING.dmMode !== 'on') return { action: 'drop' }
     if (access.allowFrom.includes(senderId)) return { action: 'deliver', access }
@@ -509,7 +548,7 @@ async function gate(msg: Message): Promise<GateResult> {
   const channelId = msg.channel.isThread()
     ? msg.channel.parentId ?? msg.channelId
     : msg.channelId
-  // LOCAL PATCH: routing active — deliver only this session's bound channel,
+  // routing active — deliver only this session's bound channel,
   // no @mention required; everything else is dropped (other sessions own it).
   if (ROUTING) {
     return channelId === boundChannelId
@@ -639,24 +678,14 @@ async function fetchTextChannel(id: string) {
 // from. DM channel ID ≠ user ID, so we inspect the fetched channel's type.
 // Thread → parent lookup mirrors the inbound gate.
 async function fetchAllowedChannel(id: string) {
-  // let (not const): DM channels may need a forced re-fetch below to resolve recipientId.
-  let ch = await fetchTextChannel(id)
+  const ch = await fetchTextChannel(id)
   const access = loadAccess()
   if (ch.type === ChannelType.DM) {
-    // A DM channel cached from an inbound messageCreate event has an unreliable
-    // recipientId: it can be undefined (no `recipients` data) or even the bot's
-    // own id, so the allowlist check below silently fails. A REST fetch
-    // (GET /channels/{id}) returns the authoritative human recipient. Force it
-    // when the cached value is missing or points at the bot itself; once
-    // resolved it stays cached, so later replies skip the extra call.
-    const botId = client.user?.id
-    if ((ch as any).recipientId == null || (ch as any).recipientId === botId) {
-      ch = (await client.channels.fetch(id, { force: true })) as typeof ch
-    }
-    if (access.allowFrom.includes((ch as any).recipientId)) return ch
+    const userId = ch.recipientId ?? dmChannelUsers.get(id)
+    if (userId && access.allowFrom.includes(userId)) return ch
   } else {
     const key = ch.isThread() ? ch.parentId ?? ch.id : ch.id
-    // LOCAL PATCH: this session's bound channel is always allowed outbound.
+    // this session's bound channel is always allowed outbound.
     if (ROUTING && key === boundChannelId) return ch
     if (key in access.groups) return ch
   }
@@ -719,7 +748,7 @@ const mcp = new Server(
 // Stores full permission details for "See more" expansion keyed by request_id.
 const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string }>()
 
-// ── LOCAL PATCH: ask_user tool — clickable questions in the bound channel ──
+// ── ask_user tool — clickable questions in the bound channel ──
 // Simple case (1 question, ≤5 short options): buttons on the message.
 // Rich case (multi-question / multi-select / long options): an "Answer"
 // button that opens a modal with one select per question + a free-text field.
@@ -766,7 +795,7 @@ function deliverAnswer(content: string, chatId: string, messageId: string, user:
     },
   })
 }
-// ── END LOCAL PATCH ────────────────────────────────────────────────────────
+// ── end ────────────────────────────────────────────────────────
 
 // Receive permission_request from CC → format → send to all allowlisted DMs.
 // Groups are intentionally excluded — the security thread resolution was
@@ -803,7 +832,7 @@ mcp.setNotificationHandler(
         .setEmoji('❌')
         .setStyle(ButtonStyle.Danger),
     )
-    // LOCAL PATCH: routing active — post the permission prompt in this
+    // routing active — post the permission prompt in this
     // session's bound channel instead of flooding the user's DMs. Button
     // clicks are still gated on access.allowFrom in interactionCreate, so a
     // channel post doesn't widen who can approve. DM fallback when nothing
@@ -814,6 +843,7 @@ mcp.setNotificationHandler(
         if ('send' in ch) {
           const sent = await ch.send({ content: text, components: [row] })
           noteSent(sent.id)
+          stopTyping(boundChannelId)
           return
         }
       } catch (e) {
@@ -895,7 +925,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['chat_id', 'message_id'],
       },
     },
-    // LOCAL PATCH: per-session channel binding control
+    // per-session channel binding control
     {
       name: 'bind_channel',
       description:
@@ -909,7 +939,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['channel'],
       },
     },
-    // LOCAL PATCH: clickable multiple-choice questions
+    // clickable multiple-choice questions
     {
       name: 'ask_user',
       description:
@@ -1026,13 +1056,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           throw new Error(`reply failed after ${sentIds.length} of ${chunks.length} chunk(s) sent: ${msg}`)
         }
 
+        stopTyping(chat_id)
         const result =
           sentIds.length === 1
             ? `sent (id: ${sentIds[0]})`
             : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`
         return { content: [{ type: 'text', text: result }] }
       }
-      // LOCAL PATCH: clickable multiple-choice questions
+      // clickable multiple-choice questions
       case 'ask_user': {
         if (!ROUTING || !boundChannelId) throw new Error('no bound channel — ask_user needs channel routing active')
         const intro = ((args.intro as string | undefined) ?? '').trim()
@@ -1081,11 +1112,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
         noteSent(sent.id)
         noteAsk(id, questions)
+        stopTyping(boundChannelId)
         return {
           content: [{ type: 'text', text: `question posted (id: ${id}) — the answer will arrive as a new channel message; end your turn now` }],
         }
       }
-      // LOCAL PATCH: per-session channel binding control
+      // per-session channel binding control
       case 'bind_channel': {
         if (!ROUTING) throw new Error('channel routing is not configured (channels.json missing)')
         const wanted = (args.channel as string).replace(/^#/, '')
@@ -1169,6 +1201,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const ch = await fetchAllowedChannel(args.chat_id as string)
         const msg = await ch.messages.fetch(args.message_id as string)
         const edited = await msg.edit(args.text as string)
+        stopTyping(args.chat_id as string)
         return { content: [{ type: 'text', text: `edited (id: ${edited.id})` }] }
       }
       case 'download_attachment': {
@@ -1223,7 +1256,7 @@ client.on('error', err => {
   process.stderr.write(`discord channel: client error: ${err}\n`)
 })
 
-// LOCAL PATCH: interaction handler for ask_user questions. Same security
+// interaction handler for ask_user questions. Same security
 // model as permission buttons: allowFrom gate + owner-only (the instance
 // that posted the ask has it in pendingAsks; others stay silent).
 client.on('interactionCreate', async (interaction: Interaction) => {
@@ -1295,7 +1328,7 @@ client.on('interactionCreate', async (interaction: Interaction) => {
   }
 })
 
-// LOCAL PATCH: channel-creation offer buttons. Same gates as everything
+// channel-creation offer buttons. Same gates as everything
 // else: paired account only, owner instance only.
 client.on('interactionCreate', async (interaction: Interaction) => {
   if (!interaction.isButton()) return
@@ -1349,7 +1382,7 @@ client.on('interactionCreate', async (interaction: Interaction) => {
   }
   const [, behavior, request_id] = m
 
-  // LOCAL PATCH: every session's server instance receives this gateway
+  // every session's server instance receives this gateway
   // interaction, but only the instance that relayed the permission request
   // has it in pendingPermissions. Non-owners must stay silent instead of
   // racing the owner's ack with "Details no longer available."
@@ -1426,6 +1459,10 @@ async function handleInbound(msg: Message): Promise<void> {
 
   const chat_id = msg.channelId
 
+  if (msg.channel.type === ChannelType.DM) {
+    dmChannelUsers.set(chat_id, msg.author.id)
+  }
+
   // Permission-reply intercept: if this looks like "yes xxxxx" for a
   // pending permission request, emit the structured event instead of
   // relaying as chat. The sender is already gate()-approved at this point
@@ -1444,10 +1481,8 @@ async function handleInbound(msg: Message): Promise<void> {
     return
   }
 
-  // Typing indicator — signals "processing" until we reply (or ~10s elapses).
-  if ('sendTyping' in msg.channel) {
-    void msg.channel.sendTyping().catch(() => {})
-  }
+  // typing indicator kept alive while the session works.
+  startTyping(msg.channel, msg.channelId)
 
   // Ack reaction — lets the user know we're processing. Fire-and-forget.
   const access = result.access
@@ -1488,7 +1523,7 @@ async function handleInbound(msg: Message): Promise<void> {
 
 client.once('ready', c => {
   process.stderr.write(`discord channel: gateway connected as ${c.user.tag}\n`)
-  // LOCAL PATCH: resolve this session's channel once the gateway is up, then
+  // resolve this session's channel once the gateway is up, then
   // re-check every 30s — picks up late hook writes and /rename mid-session.
   const rebind = () =>
     void bindSessionChannel().catch(err =>
