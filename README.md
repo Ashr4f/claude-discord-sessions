@@ -85,6 +85,7 @@ The plugin auto-updates on Claude Code startup like any marketplace plugin. To s
 ## Security
 
 - Only your paired Discord account can trigger the session or click permission/question buttons.
+- The plugin pre-approves its own Discord tools (reply, react, ask_user, ...) via a bundled PreToolUse hook, so Claude never prompts you for permission just to answer you on Discord. This covers only this plugin's tools, nothing else.
 - Anything posted in an opted-in channel by others is treated as untrusted; the plugin refuses access-control changes requested from Discord itself.
 - The bot token lives only on your machine (`.env`), never in this repo.
 
