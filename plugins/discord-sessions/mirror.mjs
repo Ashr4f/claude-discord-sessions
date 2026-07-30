@@ -60,6 +60,7 @@ try {
 
 const texts = []
 let sawDiscordSend = false
+let fromDiscord = false
 for (let i = lines.length - 1; i >= 0; i--) {
   let rec
   try {
@@ -72,7 +73,14 @@ for (let i = lines.length - 1; i >= 0; i--) {
     const isReal =
       typeof c === 'string' ||
       (Array.isArray(c) && c.some(b => b.type === 'text') && !c.some(b => b.type === 'tool_result'))
-    if (isReal) break
+    if (isReal) {
+      // Surface separation: only Discord-originated turns get mirrored, as a
+      // safety net when the model forgot to reply there. Terminal turns stay
+      // in the terminal.
+      const txt = typeof c === 'string' ? c : c.filter(b => b.type === 'text').map(b => b.text).join('\n')
+      fromDiscord = /<channel[^>]*source="(plugin:)?discord/.test(txt)
+      break
+    }
     continue
   }
   if (rec.type !== 'assistant') continue
@@ -83,7 +91,7 @@ for (let i = lines.length - 1; i >= 0; i--) {
     }
   }
 }
-if (sawDiscordSend || texts.length === 0) process.exit(0)
+if (!fromDiscord || sawDiscordSend || texts.length === 0) process.exit(0)
 
 const content = texts.join('\n\n')
 if (!content.trim() || /^Replied on Discord\.?$/i.test(content.trim())) process.exit(0)
