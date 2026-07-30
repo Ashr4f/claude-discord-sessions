@@ -37,13 +37,26 @@ This is a fork of the official `discord` plugin for Claude Code (Apache-2.0, by 
 
 If you use the official `discord` plugin, disable it (`/plugin`) — running both doubles every connection.
 
-**4. Save your bot token:** create `~/.claude/channels/discord/.env` containing:
+**4. Allow the plugin to deliver messages.** Claude Code only lets plugins on its default allowlist push inbound messages, and third-party plugins are not on it — without this step the bot can talk but never hears you. Add to `~/.claude/settings.json`:
+
+```json
+{
+  "channelsEnabled": true,
+  "allowedChannelPlugins": [
+    { "marketplace": "claude-discord-sessions", "plugin": "discord-sessions" }
+  ]
+}
+```
+
+Note: `allowedChannelPlugins` replaces the default allowlist. If you also use other channel plugins (telegram, etc.), list them here too.
+
+**5. Save your bot token:** create `~/.claude/channels/discord/.env` containing:
 
 ```
 DISCORD_BOT_TOKEN=your-token-here
 ```
 
-**5. Configure your server id:** create `~/.claude/channels/discord/channels.json`:
+**6. Configure your server id:** create `~/.claude/channels/discord/channels.json`:
 
 ```json
 {
@@ -56,7 +69,7 @@ DISCORD_BOT_TOKEN=your-token-here
 
 (Server id: enable Developer Mode in Discord settings, right-click your server, Copy Server ID. Without this file the plugin behaves like the stock DM-based plugin.)
 
-**6. Pair and test:** restart Claude Code, DM the bot once, it replies with a code, then run `/discord-sessions:access pair <code>` in Claude Code. Rename a session (`/rename my project`), create `#my-project`, type one prompt in the session, wait 30s, and message the channel.
+**7. Pair and test:** restart Claude Code, DM the bot once, it replies with a code, then run `/discord-sessions:access pair <code>` in Claude Code. Rename a session (`/rename my project`), create `#my-project`, type one prompt in the session, wait 30s, and message the channel.
 
 ## Rules of thumb
 
