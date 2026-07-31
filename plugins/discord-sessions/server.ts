@@ -491,8 +491,24 @@ function mdTablesToAscii(text: string): string {
       }
       const widths: number[] = []
       for (const r of rows) r.forEach((c, k) => { widths[k] = Math.max(widths[k] ?? 0, c.length) })
-      const fmt = (r: string[]) => r.map((c, k) => (c ?? '').padEnd(widths[k])).join('  ').trimEnd()
-      out.push('```', fmt(rows[0]), widths.map(w => '-'.repeat(w)).join('  '), ...rows.slice(1).map(fmt), '```')
+      const total = widths.reduce((a, b) => a + b, 0) + 2 * (widths.length - 1)
+      if (total <= 60) {
+        const fmt = (r: string[]) => r.map((c, k) => (c ?? '').padEnd(widths[k])).join('  ').trimEnd()
+        out.push('```', fmt(rows[0]), widths.map(w => '-'.repeat(w)).join('  '), ...rows.slice(1).map(fmt), '```')
+      } else {
+        // Discord wraps long lines inside code blocks, which shreds wide
+        // tables. Render one record per row instead — fits any screen width.
+        const headers = rows[0]
+        out.push('```')
+        rows.slice(1).forEach((r, idx) => {
+          if (idx > 0) out.push('')
+          out.push(`▸ ${r[0]}`)
+          for (let k = 1; k < r.length; k++) {
+            if ((r[k] ?? '').trim()) out.push(`  ${headers[k]}: ${r[k]}`)
+          }
+        })
+        out.push('```')
+      }
       i = j
     } else {
       out.push(lines[i])
