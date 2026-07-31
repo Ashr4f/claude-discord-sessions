@@ -1478,6 +1478,9 @@ client.on('interactionCreate', async (interaction: Interaction) => {
 
 client.on('messageCreate', msg => {
   if (msg.author.bot) return
+  // System events (thread created, message pinned, member joined, boosts...)
+  // are not conversation — never deliver or react to them.
+  if (msg.system) return
   handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
 })
 
