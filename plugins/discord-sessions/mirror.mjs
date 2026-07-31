@@ -108,6 +108,25 @@ const missing = texts.filter(t => {
   return !(t.length >= 20 && sentBlob.includes(t.slice(0, 80)))
 })
 if (missing.length === 0) process.exit(0)
+
+// Live mirroring: this script also runs on PostToolUse, so blocks stream to
+// Discord as the turn progresses instead of arriving in a batch at the end.
+// A rolling per-session state of already-mirrored block keys prevents
+// re-posting the same block on the next hook invocation.
+import { mkdirSync, writeFileSync } from 'fs'
+const stateDir = join(STATE_DIR, 'mirror-state')
+const stateFile = join(stateDir, `${hook.session_id}.json`)
+let mirrored = []
+try {
+  mirrored = JSON.parse(readFileSync(stateFile, 'utf8'))
+} catch {}
+const keyOf = t => t.slice(0, 80)
+const fresh = missing.filter(t => !mirrored.includes(keyOf(t)))
+if (fresh.length === 0) process.exit(0)
+try {
+  mkdirSync(stateDir, { recursive: true })
+  writeFileSync(stateFile, JSON.stringify([...mirrored, ...fresh.map(keyOf)].slice(-100)))
+} catch {}
 // Markdown tables don't render on Discord — convert to monospace blocks.
 function mdTablesToAscii(text) {
   const src = text.split('\n')
@@ -136,8 +155,8 @@ function mdTablesToAscii(text) {
   return out.join('\n')
 }
 
-const content = mdTablesToAscii(missing.join('\n\n'))
-if (!content.trim()) process.exit(0)
+const blocks = fresh.map(mdTablesToAscii).filter(t => t.trim())
+if (blocks.length === 0) process.exit(0)
 
 const api = async (path, init) => {
   const res = await fetch(`https://discord.com/api/v10${path}`, {
@@ -156,13 +175,16 @@ try {
     if (!ch) process.exit(0)
     targetId = ch.id
   }
-  // 🖥️ marks messages mirrored from the terminal transcript.
-  const full = `🖥️ ${content}`
-  for (let i = 0; i < full.length && i < 3 * 1900; i += 1900) {
-    await api(`/channels/${targetId}/messages`, {
-      method: 'POST',
-      body: JSON.stringify({ content: full.slice(i, i + 1900) }),
-    })
+  // 🖥️ marks messages mirrored from the terminal transcript. Flag 4096 =
+  // SUPPRESS_NOTIFICATIONS (@silent): these are progress notes, no ping.
+  for (const block of blocks) {
+    const full = `🖥️ ${block}`
+    for (let i = 0; i < full.length && i < 3 * 1900; i += 1900) {
+      await api(`/channels/${targetId}/messages`, {
+        method: 'POST',
+        body: JSON.stringify({ content: full.slice(i, i + 1900), flags: 4096 }),
+      })
+    }
   }
 } catch (err) {
   process.stderr.write(`discord mirror: ${err}\n`)
