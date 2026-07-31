@@ -838,7 +838,7 @@ function retireStalePermissionPrompts(): void {
 // button that opens a modal with one select per question + a free-text field.
 // Non-blocking: the tool returns after posting; the user's choice is injected
 // back into the session as a normal inbound channel message.
-type AskOption = { label: string; style?: string }
+type AskOption = { label: string; style?: string; description?: string }
 type AskQuestion = { q: string; options: AskOption[]; multi?: boolean }
 const pendingAsks = new Map<string, { questions: AskQuestion[] }>()
 
@@ -1058,6 +1058,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
                             enum: ['primary', 'secondary', 'success', 'danger'],
                             description: 'Button color (buttons mode only): success=green for approve/positive, danger=red for reject/destructive, secondary=grey for neutral, primary=blue (default). Omit to auto-color by yes/no semantics.',
                           },
+                          description: {
+                            type: 'string',
+                            description: 'Shown under the option in dropdown/form mode (max 100 chars). Use it to mark your recommendation ("my recommendation: fastest and safest") or explain a tradeoff. In buttons mode append "(recommended)" to the label instead.',
+                          },
                         },
                         required: ['label'],
                       },
@@ -1184,7 +1188,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           options: (qq.options as any[]).slice(0, 25).map(o =>
             typeof o === 'string'
               ? { label: o.slice(0, 100) }
-              : { label: String(o.label).slice(0, 100), style: o.style as string | undefined },
+              : { label: String(o.label).slice(0, 100), style: o.style as string | undefined, description: o.description ? String(o.description) : undefined },
           ),
           multi: !!qq.multi,
         }))
@@ -1406,7 +1410,7 @@ client.on('interactionCreate', async (interaction: Interaction) => {
         .setCustomId(`q${qi}`)
         .setMinValues(1)
         .setMaxValues(qq.multi ? qq.options.length : 1)
-        .addOptions(qq.options.map(o => ({ label: o.label, value: o.label })))
+        .addOptions(qq.options.map(o => ({ label: o.label, value: o.label, ...(o.description ? { description: o.description.slice(0, 100) } : {}) })))
       modal.addLabelComponents(l => l.setLabel(qq.q.slice(0, 45)).setStringSelectMenuComponent(sel))
     })
     if (ask.questions.length < 5) {
