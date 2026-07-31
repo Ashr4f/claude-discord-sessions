@@ -61,6 +61,7 @@ try {
 const texts = []
 const discordSentTexts = []
 let fromDiscord = false
+let originChatId = null
 for (let i = lines.length - 1; i >= 0; i--) {
   let rec
   try {
@@ -79,6 +80,10 @@ for (let i = lines.length - 1; i >= 0; i--) {
       // send to the channel. Terminal turns stay in the terminal.
       const txt = typeof c === 'string' ? c : c.filter(b => b.type === 'text').map(b => b.text).join('\n')
       fromDiscord = /<channel[^>]*source="(plugin:)?discord/.test(txt)
+      // Post where the conversation actually happened (thread or channel),
+      // not to the bound channel name — a thread message must be mirrored
+      // into its thread.
+      originChatId = txt.match(/<channel[^>]*chat_id="(\d+)"/)?.[1] ?? null
       break
     }
     continue
@@ -144,13 +149,17 @@ const api = async (path, init) => {
 }
 
 try {
-  const channels = await api(`/guilds/${guildId}/channels`)
-  const ch = channels.find(c => c.type === 0 && c.name === channelName)
-  if (!ch) process.exit(0)
+  let targetId = originChatId
+  if (!targetId) {
+    const channels = await api(`/guilds/${guildId}/channels`)
+    const ch = channels.find(c => c.type === 0 && c.name === channelName)
+    if (!ch) process.exit(0)
+    targetId = ch.id
+  }
   // 🖥️ marks messages mirrored from the terminal transcript.
   const full = `🖥️ ${content}`
   for (let i = 0; i < full.length && i < 3 * 1900; i += 1900) {
-    await api(`/channels/${ch.id}/messages`, {
+    await api(`/channels/${targetId}/messages`, {
       method: 'POST',
       body: JSON.stringify({ content: full.slice(i, i + 1900) }),
     })
