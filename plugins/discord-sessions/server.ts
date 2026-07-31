@@ -481,6 +481,31 @@ const TYPING_MAX_MS = 15 * 60 * 1000
 
 // Markdown tables don't render on Discord. Convert them to aligned
 // monospace blocks so replies stay readable without model cooperation.
+// Visual width of a cell: emoji and CJK render two columns wide in
+// monospace fonts while string length counts them as 1-2 code units, which
+// skews the box borders. Variation selectors render zero-wide.
+function displayWidth(s: string): number {
+  let w = 0
+  for (const ch of s) {
+    const cp = ch.codePointAt(0) ?? 0
+    if (cp === 0xfe0f || cp === 0x200d) continue
+    if (
+      cp >= 0x1f000 ||
+      (cp >= 0x2600 && cp <= 0x27bf) ||
+      (cp >= 0x2b00 && cp <= 0x2bff) ||
+      (cp >= 0x2e80 && cp <= 0xa4cf) ||
+      (cp >= 0xac00 && cp <= 0xd7a3) ||
+      (cp >= 0xf900 && cp <= 0xfaff) ||
+      (cp >= 0xff00 && cp <= 0xff60)
+    ) {
+      w += 2
+    } else {
+      w += 1
+    }
+  }
+  return w
+}
+
 function mdTablesToAscii(text: string, forFile = false): string {
   const lines = text.split('\n')
   const out: string[] = []
@@ -496,13 +521,13 @@ function mdTablesToAscii(text: string, forFile = false): string {
         j++
       }
       const widths: number[] = []
-      for (const r of rows) r.forEach((c, k) => { widths[k] = Math.max(widths[k] ?? 0, c.length) })
+      for (const r of rows) r.forEach((c, k) => { widths[k] = Math.max(widths[k] ?? 0, displayWidth(c)) })
       const total = widths.reduce((a, b) => a + b, 0) + 2 * (widths.length - 1)
       if (forFile) {
         // Attachment previews use a monospace font and do not wrap, so a
         // full box-drawing table works at any width.
         const cell = (c: string, w: number) => {
-          const space = w - c.length
+          const space = w - displayWidth(c)
           const left = Math.floor(space / 2)
           return ` ${' '.repeat(left)}${c}${' '.repeat(space - left)} `
         }
@@ -516,7 +541,7 @@ function mdTablesToAscii(text: string, forFile = false): string {
         })
         out.push(line('╚', '═', '╩', '╝'))
       } else if (total <= 60) {
-        const fmt = (r: string[]) => r.map((c, k) => (c ?? '').padEnd(widths[k])).join('  ').trimEnd()
+        const fmt = (r: string[]) => r.map((c, k) => (c ?? '') + ' '.repeat(Math.max(0, widths[k] - displayWidth(c ?? '')))).join('  ').trimEnd()
         out.push('```', fmt(rows[0]), widths.map(w => '-'.repeat(w)).join('  '), ...rows.slice(1).map(fmt), '```')
       } else {
         // Discord wraps long lines inside code blocks, which shreds wide
