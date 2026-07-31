@@ -26,6 +26,7 @@ import {
   ButtonStyle,
   ActionRowBuilder,
   ModalBuilder,
+  AttachmentBuilder,
   StringSelectMenuBuilder,
   TextInputBuilder,
   TextInputStyle,
@@ -1120,6 +1121,29 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
         const mode = access.chunkMode ?? 'length'
         const replyMode = access.replyToMode ?? 'first'
+
+        // Very long replies become a short lead + an attached message.md
+        // (built from a buffer, no file on disk) — the same UX Discord uses
+        // when a pasted message is too long. The attachment preview renders
+        // the full markdown better than a stream of 2000-char chunks.
+        if (text.length > 3800) {
+          const cut = text.indexOf('\n') > 0 && text.indexOf('\n') <= 400 ? text.indexOf('\n') : Math.min(400, text.length)
+          const lead = `${text.slice(0, cut).trimEnd()}\n📄 full message attached`
+          const sent = await ch.send({
+            content: lead,
+            files: [
+              new AttachmentBuilder(Buffer.from(args.text as string, 'utf8'), { name: 'message.md' }),
+              ...files.slice(0, 9),
+            ],
+            ...(reply_to != null && replyMode !== 'off'
+              ? { reply: { messageReference: reply_to, failIfNotExists: false } }
+              : {}),
+          })
+          noteSent(sent.id)
+          stopTyping(chat_id)
+          return { content: [{ type: 'text', text: `sent as attachment (id: ${sent.id})` }] }
+        }
+
         const chunks = chunk(text, limit, mode)
         const sentIds: string[] = []
 
