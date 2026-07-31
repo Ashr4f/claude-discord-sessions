@@ -1131,14 +1131,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const mode = access.chunkMode ?? 'length'
         const replyMode = access.replyToMode ?? 'first'
 
-        // Very long replies and anything containing a table become a short
-        // lead + an attached message.md (built from a buffer, no file on
-        // disk) — the same UX Discord uses when a pasted message is too
-        // long. The attachment preview is monospace and never wraps, so
-        // tables stay aligned at any width, phone included.
+        // Any reply containing a table becomes a short lead + an attached
+        // message.md (built from a buffer, no file on disk): the attachment
+        // preview is monospace and never wraps, so tables stay aligned at
+        // any width. Long table-free replies are NOT attached — they split
+        // into multiple messages on paragraph boundaries below.
         const original = args.text as string
         const containsTable = /^\s*\|[\s:|-]+\|\s*$/m.test(original)
-        if (text.length > 3800 || containsTable) {
+        if (containsTable) {
           const firstTableAt = containsTable ? original.search(/^\s*\|.*\|\s*$/m) : -1
           const leadSrc = firstTableAt > 0 ? original.slice(0, firstTableAt) : original
           const cut = leadSrc.indexOf('\n') > 0 && leadSrc.indexOf('\n') <= 400 ? leadSrc.indexOf('\n') : Math.min(400, leadSrc.length)
