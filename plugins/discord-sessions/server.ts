@@ -499,10 +499,22 @@ function mdTablesToAscii(text: string, forFile = false): string {
       for (const r of rows) r.forEach((c, k) => { widths[k] = Math.max(widths[k] ?? 0, c.length) })
       const total = widths.reduce((a, b) => a + b, 0) + 2 * (widths.length - 1)
       if (forFile) {
-        // Attachment previews use a monospace font and do not wrap, so the
-        // aligned form works at any width and needs no code fences.
-        const fmt = (r: string[]) => r.map((c, k) => (c ?? '').padEnd(widths[k])).join('  ').trimEnd()
-        out.push(fmt(rows[0]), widths.map(w => '-'.repeat(w)).join('  '), ...rows.slice(1).map(fmt))
+        // Attachment previews use a monospace font and do not wrap, so a
+        // full box-drawing table works at any width.
+        const cell = (c: string, w: number) => {
+          const space = w - c.length
+          const left = Math.floor(space / 2)
+          return ` ${' '.repeat(left)}${c}${' '.repeat(space - left)} `
+        }
+        const line = (l: string, fill: string, mid: string, r: string) =>
+          l + widths.map(w => fill.repeat(w + 2)).join(mid) + r
+        const row = (r: string[]) => '║' + r.map((c, k) => cell(c ?? '', widths[k])).join('║') + '║'
+        out.push(line('╔', '═', '╦', '╗'), row(rows[0]), line('╠', '═', '╬', '╣'))
+        rows.slice(1).forEach((r, idx) => {
+          if (idx > 0) out.push(line('╟', '─', '╫', '╢'))
+          out.push(row(r))
+        })
+        out.push(line('╚', '═', '╩', '╝'))
       } else if (total <= 60) {
         const fmt = (r: string[]) => r.map((c, k) => (c ?? '').padEnd(widths[k])).join('  ').trimEnd()
         out.push('```', fmt(rows[0]), widths.map(w => '-'.repeat(w)).join('  '), ...rows.slice(1).map(fmt), '```')
