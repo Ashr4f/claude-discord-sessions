@@ -104,7 +104,7 @@ if (!fromDiscord || texts.length === 0) process.exit(0)
 // appears in one of the turn's replies.
 const sentBlob = discordSentTexts.join('\n')
 const missing = texts.filter(t => {
-  if (/^Replied on Discord\.?$/i.test(t)) return false
+  if (/^(Replied|Reacted|Posted) on Discord.?$/i.test(t)) return false
   return !(t.length >= 20 && sentBlob.includes(t.slice(0, 80)))
 })
 if (missing.length === 0) process.exit(0)
