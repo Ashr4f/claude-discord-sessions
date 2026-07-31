@@ -1151,7 +1151,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           const sent = await ch.send({
             content: lead,
             files: [
-              new AttachmentBuilder(Buffer.from(mdTablesToAscii(original, true), 'utf8'), { name: 'message.md' }),
+              new AttachmentBuilder(Buffer.from(mdTablesToAscii(original, true), 'utf8'), { name: 'message.txt' }),
               ...files.slice(0, 9),
             ],
             ...(reply_to != null && replyMode !== 'off'
