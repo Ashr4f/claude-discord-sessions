@@ -525,7 +525,27 @@ function mdTablesToAscii(text: string, forFile = false): string {
       const total = widths.reduce((a, b) => a + b, 0) + 2 * (widths.length - 1)
       if (forFile) {
         // Attachment previews use a monospace font and do not wrap, so a
-        // full box-drawing table works at any width.
+        // full box-drawing table works at any width. Emoji however come
+        // from a separate font with fractional advance — no padding can
+        // align them. Swap the common status emoji for ASCII tokens and
+        // strip the rest, so cells are pure monospace.
+        const EMOJI_TOKENS: [RegExp, string][] = [
+          [/✅/g, '[v]'],
+          [/❌/g, '[x]'],
+          [/\u{1F501}/gu, '[~]'],
+          [/⬜|⬛/g, '[ ]'],
+          [/⚠(️)?/g, '[!]'],
+        ]
+        for (const r of rows) {
+          r.forEach((c, k) => {
+            let v = c ?? ''
+            for (const [re, tok] of EMOJI_TOKENS) v = v.replace(re, tok)
+            v = v.replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}\u{200D}]/gu, '').trim()
+            r[k] = v || '-'
+          })
+        }
+        widths.length = 0
+        for (const r of rows) r.forEach((c, k) => { widths[k] = Math.max(widths[k] ?? 0, displayWidth(c)) })
         const cell = (c: string, w: number) => {
           const space = w - displayWidth(c)
           const left = Math.floor(space / 2)
