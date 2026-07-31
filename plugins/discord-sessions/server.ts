@@ -468,7 +468,39 @@ function noteSent(id: string): void {
 // either done or waiting on the user). Hard cap in case the session
 // finishes its turn without sending anything.
 const typingTimers = new Map<string, ReturnType<typeof setInterval>>()
-const TYPING_MAX_MS = 90 * 1000
+// Long tasks legitimately type for many minutes. The hang case (session
+// never responds) is covered separately: our own outgoing messages stop the
+// indicator (see messageCreate), including mirror-hook posts sent over REST.
+const TYPING_MAX_MS = 15 * 60 * 1000
+
+// Markdown tables don't render on Discord. Convert them to aligned
+// monospace blocks so replies stay readable without model cooperation.
+function mdTablesToAscii(text: string): string {
+  const lines = text.split('\n')
+  const out: string[] = []
+  let i = 0
+  while (i < lines.length) {
+    if (/^\s*\|.*\|\s*$/.test(lines[i]) && i + 1 < lines.length && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1])) {
+      const rows: string[][] = []
+      let j = i
+      while (j < lines.length && /^\s*\|.*\|\s*$/.test(lines[j])) {
+        if (!/^\s*\|[\s:|-]+\|\s*$/.test(lines[j])) {
+          rows.push(lines[j].trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim().replace(/\*\*/g, '')))
+        }
+        j++
+      }
+      const widths: number[] = []
+      for (const r of rows) r.forEach((c, k) => { widths[k] = Math.max(widths[k] ?? 0, c.length) })
+      const fmt = (r: string[]) => r.map((c, k) => (c ?? '').padEnd(widths[k])).join('  ').trimEnd()
+      out.push('```', fmt(rows[0]), widths.map(w => '-'.repeat(w)).join('  '), ...rows.slice(1).map(fmt), '```')
+      i = j
+    } else {
+      out.push(lines[i])
+      i++
+    }
+  }
+  return out.join('\n')
+}
 
 function stopTyping(channelId: string | null): void {
   if (!channelId) return
@@ -1052,7 +1084,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     switch (req.params.name) {
       case 'reply': {
         const chat_id = args.chat_id as string
-        const text = args.text as string
+        const text = mdTablesToAscii(args.text as string)
         const reply_to = args.reply_to as string | undefined
         const files = (args.files as string[] | undefined) ?? []
 
@@ -1477,6 +1509,12 @@ client.on('interactionCreate', async (interaction: Interaction) => {
 })
 
 client.on('messageCreate', msg => {
+  // Any message we send (including mirror-hook posts made over REST from a
+  // separate process) means the user got something — stop the indicator.
+  if (msg.author.id === client.user?.id) {
+    stopTyping(msg.channelId)
+    return
+  }
   if (msg.author.bot) return
   // System events (thread created, message pinned, member joined, boosts...)
   // are not conversation — never deliver or react to them.

@@ -103,7 +103,35 @@ const missing = texts.filter(t => {
   return !(t.length >= 20 && sentBlob.includes(t.slice(0, 80)))
 })
 if (missing.length === 0) process.exit(0)
-const content = missing.join('\n\n')
+// Markdown tables don't render on Discord — convert to monospace blocks.
+function mdTablesToAscii(text) {
+  const src = text.split('\n')
+  const out = []
+  let i = 0
+  while (i < src.length) {
+    if (/^\s*\|.*\|\s*$/.test(src[i]) && i + 1 < src.length && /^\s*\|[\s:|-]+\|\s*$/.test(src[i + 1])) {
+      const rows = []
+      let j = i
+      while (j < src.length && /^\s*\|.*\|\s*$/.test(src[j])) {
+        if (!/^\s*\|[\s:|-]+\|\s*$/.test(src[j])) {
+          rows.push(src[j].trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim().replace(/\*\*/g, '')))
+        }
+        j++
+      }
+      const widths = []
+      for (const r of rows) r.forEach((c, k) => { widths[k] = Math.max(widths[k] ?? 0, c.length) })
+      const fmt = r => r.map((c, k) => (c ?? '').padEnd(widths[k])).join('  ').trimEnd()
+      out.push('```', fmt(rows[0]), widths.map(w => '-'.repeat(w)).join('  '), ...rows.slice(1).map(fmt), '```')
+      i = j
+    } else {
+      out.push(src[i])
+      i++
+    }
+  }
+  return out.join('\n')
+}
+
+const content = mdTablesToAscii(missing.join('\n\n'))
 if (!content.trim()) process.exit(0)
 
 const api = async (path, init) => {
