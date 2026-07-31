@@ -141,6 +141,11 @@ let boundChannelName: string | null = null
 // Set by the bind_channel tool — stops the 30s poll from clobbering a
 // manual binding.
 let manualBind = false
+// Where the conversation actually lives right now: the bound channel, or a
+// thread inside it once the user talks from one. Permission prompts and
+// ask_user questions follow the conversation instead of always landing in
+// the parent channel.
+let lastChatId: string | null = null
 
 // The SessionStart hook (the plugin's session-map.mjs hook) writes
 // sessions/<pid>.json for the Claude process and its ancestors. We walk our
@@ -928,13 +933,13 @@ mcp.setNotificationHandler(
     // is bound (yet) or the channel send fails.
     if (ROUTING && boundChannelId) {
       try {
-        const ch = await fetchTextChannel(boundChannelId)
+        const ch = await fetchTextChannel(lastChatId ?? boundChannelId)
         if ('send' in ch) {
           const sent = await ch.send({ content: text, components: [row] })
           noteSent(sent.id)
           const entry = pendingPermissions.get(request_id)
-          if (entry) entry.msgRef = { channelId: boundChannelId, messageId: sent.id, postedAt: Date.now() }
-          stopTyping(boundChannelId)
+          if (entry) entry.msgRef = { channelId: ch.id, messageId: sent.id, postedAt: Date.now() }
+          stopTyping(ch.id)
           return
         }
       } catch (e) {
@@ -1203,7 +1208,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           multi: !!qq.multi,
         }))
         const id = randomBytes(4).toString('hex')
-        const ch = await fetchTextChannel(boundChannelId)
+        // Follow the conversation: post in the thread the user talked from,
+        // falling back to the bound channel itself.
+        const ch = await fetchTextChannel(lastChatId ?? boundChannelId)
         if (!('send' in ch)) throw new Error('bound channel is not sendable')
 
         const simple =
@@ -1238,7 +1245,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
         noteSent(sent.id)
         noteAsk(id, questions)
-        stopTyping(boundChannelId)
+        stopTyping(ch.id)
         return {
           content: [{ type: 'text', text: `question posted (id: ${id}) — the answer will arrive as a new channel message; end your turn now` }],
         }
@@ -1667,6 +1674,7 @@ async function handleInbound(msg: Message): Promise<void> {
 
   // LOCAL PATCH: typing indicator kept alive while the session works.
   startTyping(msg.channel, msg.channelId)
+  lastChatId = msg.channelId
 
   // Ack reaction — lets the user know we're processing. Fire-and-forget.
   const access = result.access
