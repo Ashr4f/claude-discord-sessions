@@ -476,7 +476,7 @@ const TYPING_MAX_MS = 15 * 60 * 1000
 
 // Markdown tables don't render on Discord. Convert them to aligned
 // monospace blocks so replies stay readable without model cooperation.
-function mdTablesToAscii(text: string): string {
+function mdTablesToAscii(text: string, forFile = false): string {
   const lines = text.split('\n')
   const out: string[] = []
   let i = 0
@@ -493,7 +493,12 @@ function mdTablesToAscii(text: string): string {
       const widths: number[] = []
       for (const r of rows) r.forEach((c, k) => { widths[k] = Math.max(widths[k] ?? 0, c.length) })
       const total = widths.reduce((a, b) => a + b, 0) + 2 * (widths.length - 1)
-      if (total <= 60) {
+      if (forFile) {
+        // Attachment previews use a monospace font and do not wrap, so the
+        // aligned form works at any width and needs no code fences.
+        const fmt = (r: string[]) => r.map((c, k) => (c ?? '').padEnd(widths[k])).join('  ').trimEnd()
+        out.push(fmt(rows[0]), widths.map(w => '-'.repeat(w)).join('  '), ...rows.slice(1).map(fmt))
+      } else if (total <= 60) {
         const fmt = (r: string[]) => r.map((c, k) => (c ?? '').padEnd(widths[k])).join('  ').trimEnd()
         out.push('```', fmt(rows[0]), widths.map(w => '-'.repeat(w)).join('  '), ...rows.slice(1).map(fmt), '```')
       } else {
@@ -1126,17 +1131,22 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const mode = access.chunkMode ?? 'length'
         const replyMode = access.replyToMode ?? 'first'
 
-        // Very long replies become a short lead + an attached message.md
-        // (built from a buffer, no file on disk) — the same UX Discord uses
-        // when a pasted message is too long. The attachment preview renders
-        // the full markdown better than a stream of 2000-char chunks.
-        if (text.length > 3800) {
-          const cut = text.indexOf('\n') > 0 && text.indexOf('\n') <= 400 ? text.indexOf('\n') : Math.min(400, text.length)
-          const lead = `${text.slice(0, cut).trimEnd()}\n📄 full message attached`
+        // Very long replies and anything containing a table become a short
+        // lead + an attached message.md (built from a buffer, no file on
+        // disk) — the same UX Discord uses when a pasted message is too
+        // long. The attachment preview is monospace and never wraps, so
+        // tables stay aligned at any width, phone included.
+        const original = args.text as string
+        const containsTable = /^\s*\|[\s:|-]+\|\s*$/m.test(original)
+        if (text.length > 3800 || containsTable) {
+          const firstTableAt = containsTable ? original.search(/^\s*\|.*\|\s*$/m) : -1
+          const leadSrc = firstTableAt > 0 ? original.slice(0, firstTableAt) : original
+          const cut = leadSrc.indexOf('\n') > 0 && leadSrc.indexOf('\n') <= 400 ? leadSrc.indexOf('\n') : Math.min(400, leadSrc.length)
+          const lead = `${leadSrc.slice(0, cut).trimEnd() || '📄'}\n📄 full message attached`
           const sent = await ch.send({
             content: lead,
             files: [
-              new AttachmentBuilder(Buffer.from(args.text as string, 'utf8'), { name: 'message.md' }),
+              new AttachmentBuilder(Buffer.from(mdTablesToAscii(original, true), 'utf8'), { name: 'message.md' }),
               ...files.slice(0, 9),
             ],
             ...(reply_to != null && replyMode !== 'off'
