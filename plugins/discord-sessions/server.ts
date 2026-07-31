@@ -1379,6 +1379,22 @@ process.stdin.on('close', shutdown)
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
 
+// The stdin-EOF shutdown doesn't always fire on Windows when the parent
+// dies, leaving a zombie gateway: the bot stays online, receives messages,
+// starts typing, and delivers into a dead pipe. Probe the parent directly
+// and exit when it's gone.
+const PARENT_PID = process.ppid
+if (PARENT_PID > 0) {
+  setInterval(() => {
+    try {
+      process.kill(PARENT_PID, 0)
+    } catch {
+      process.stderr.write('discord channel: parent process gone, shutting down\n')
+      shutdown()
+    }
+  }, 20_000).unref()
+}
+
 client.on('error', err => {
   process.stderr.write(`discord channel: client error: ${err}\n`)
 })
@@ -1563,10 +1579,12 @@ client.on('interactionCreate', async (interaction: Interaction) => {
 })
 
 client.on('messageCreate', msg => {
-  // Any message we send (including mirror-hook posts made over REST from a
-  // separate process) means the user got something — stop the indicator.
+  // Our own messages: a real reply stops the typing indicator, but a live
+  // mirror post (🖥️, streamed mid-turn) must not — Claude is still working.
+  // The mirror's final Stop-hook post carries an invisible marker (U+2063)
+  // and does stop it, so a turn that ends without a reply can't hang.
   if (msg.author.id === client.user?.id) {
-    stopTyping(msg.channelId)
+    if (!msg.content.startsWith('🖥️') || msg.content.includes('⁣')) stopTyping(msg.channelId)
     return
   }
   if (msg.author.bot) return

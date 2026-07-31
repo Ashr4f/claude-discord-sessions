@@ -171,8 +171,12 @@ function mdTablesToAscii(text) {
   return out.join('\n')
 }
 
-const blocks = fresh.map(mdTablesToAscii).filter(t => t.trim())
+const blocks = fresh.map(t => mdTablesToAscii(t)).filter(t => t.trim())
 if (blocks.length === 0) process.exit(0)
+// The final Stop-hook post carries an invisible marker (U+2063) so the
+// server knows the turn is over and stops the typing indicator; mid-turn
+// PostToolUse posts must keep it alive.
+if (hook.hook_event_name === 'Stop') blocks[blocks.length - 1] += '⁣'
 
 const api = async (path, init) => {
   const res = await fetch(`https://discord.com/api/v10${path}`, {
