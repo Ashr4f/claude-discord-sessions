@@ -127,8 +127,20 @@ try {
   mkdirSync(stateDir, { recursive: true })
   writeFileSync(stateFile, JSON.stringify([...mirrored, ...fresh.map(keyOf)].slice(-100)))
 } catch {}
-// Markdown tables don't render on Discord — convert to monospace blocks.
-function mdTablesToAscii(text) {
+// Markdown tables don't render on Discord. In-chat: aligned block or
+// per-row layout. forFile: box-drawing table with emoji swapped for ASCII
+// tokens (emoji have fractional width, they can never align).
+function displayWidth(s) {
+  let w = 0
+  for (const ch of s) {
+    const cp = ch.codePointAt(0) ?? 0
+    if (cp === 0xfe0f || cp === 0x200d) continue
+    w += cp >= 0x1f000 || (cp >= 0x2600 && cp <= 0x27bf) || (cp >= 0x2b00 && cp <= 0x2bff) || (cp >= 0x2e80 && cp <= 0xa4cf) || (cp >= 0xac00 && cp <= 0xd7a3) || (cp >= 0xff00 && cp <= 0xff60) ? 2 : 1
+  }
+  return w
+}
+
+function mdTablesToAscii(text, forFile = false) {
   const src = text.split('\n')
   const out = []
   let i = 0
@@ -142,15 +154,38 @@ function mdTablesToAscii(text) {
         }
         j++
       }
+      if (forFile) {
+        const TOKENS = [[/✅/g, '[v]'], [/❌/g, '[x]'], [/\u{1F501}/gu, '[~]'], [/⬜|⬛/g, '[ ]'], [/⚠(️)?/g, '[!]']]
+        for (const r of rows) {
+          r.forEach((c, k) => {
+            let v = c ?? ''
+            for (const [re, tok] of TOKENS) v = v.replace(re, tok)
+            v = v.replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}\u{200D}]/gu, '').trim()
+            r[k] = v || '-'
+          })
+        }
+      }
       const widths = []
-      for (const r of rows) r.forEach((c, k) => { widths[k] = Math.max(widths[k] ?? 0, c.length) })
+      for (const r of rows) r.forEach((c, k) => { widths[k] = Math.max(widths[k] ?? 0, displayWidth(c)) })
       const total = widths.reduce((a, b) => a + b, 0) + 2 * (widths.length - 1)
-      if (total <= 60) {
-        const fmt = r => r.map((c, k) => (c ?? '').padEnd(widths[k])).join('  ').trimEnd()
+      if (forFile) {
+        const cell = (c, w) => {
+          const space = w - displayWidth(c)
+          const left = Math.floor(space / 2)
+          return ` ${' '.repeat(left)}${c}${' '.repeat(space - left)} `
+        }
+        const line = (l, fill, mid, r) => l + widths.map(w => fill.repeat(w + 2)).join(mid) + r
+        const row = r => '║' + r.map((c, k) => cell(c ?? '', widths[k])).join('║') + '║'
+        out.push(line('╔', '═', '╦', '╗'), row(rows[0]), line('╠', '═', '╬', '╣'))
+        rows.slice(1).forEach((r, idx) => {
+          if (idx > 0) out.push(line('╟', '─', '╫', '╢'))
+          out.push(row(r))
+        })
+        out.push(line('╚', '═', '╩', '╝'))
+      } else if (total <= 60) {
+        const fmt = r => r.map((c, k) => (c ?? '') + ' '.repeat(Math.max(0, widths[k] - displayWidth(c ?? '')))).join('  ').trimEnd()
         out.push('```', fmt(rows[0]), widths.map(w => '-'.repeat(w)).join('  '), ...rows.slice(1).map(fmt), '```')
       } else {
-        // Discord wraps long lines inside code blocks, which shreds wide
-        // tables. Render one record per row instead — fits any screen width.
         const headers = rows[0]
         out.push('```')
         rows.slice(1).forEach((r, idx) => {
@@ -171,21 +206,40 @@ function mdTablesToAscii(text) {
   return out.join('\n')
 }
 
-const blocks = fresh.map(t => mdTablesToAscii(t)).filter(t => t.trim())
+// When the turn ends with NO real reply, the mirrored content IS the answer:
+// deliver it as a normal message (ping, no 🖥️ prefix) instead of a silent
+// system note. Mid-turn narration and leftovers next to a real reply stay
+// silent progress notes.
+const isAnswerFallback = hook.hook_event_name === 'Stop' && discordSentTexts.length === 0
+const blocks = fresh.filter(t => t.trim())
 if (blocks.length === 0) process.exit(0)
 // The final Stop-hook post carries an invisible marker (U+2063) so the
 // server knows the turn is over and stops the typing indicator; mid-turn
 // PostToolUse posts must keep it alive.
-if (hook.hook_event_name === 'Stop') blocks[blocks.length - 1] += '⁣'
+const finalMark = hook.hook_event_name === 'Stop' ? '⁣' : ''
 
 const api = async (path, init) => {
   const res = await fetch(`https://discord.com/api/v10${path}`, {
     ...init,
-    headers: { Authorization: `Bot ${token}`, 'Content-Type': 'application/json' },
+    headers: { Authorization: `Bot ${token}`, ...(init.headers ?? {}) },
   })
   if (!res.ok) throw new Error(`${res.status} ${await res.text()}`)
   return res.json()
 }
+const postJson = (channelId, payload) =>
+  api(`/channels/${channelId}/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+const postWithFile = (channelId, payload, filename, fileText) => {
+  const form = new FormData()
+  form.append('payload_json', JSON.stringify(payload))
+  form.append('files[0]', new Blob([fileText], { type: 'text/plain' }), filename)
+  return api(`/channels/${channelId}/messages`, { method: 'POST', body: form })
+}
+
+const hasTable = t => /^\s*\|[\s:|-]+\|\s*$/m.test(t)
 
 try {
   let targetId = originChatId
@@ -195,15 +249,27 @@ try {
     if (!ch) process.exit(0)
     targetId = ch.id
   }
-  // 🖥️ marks messages mirrored from the terminal transcript. Flag 4096 =
-  // SUPPRESS_NOTIFICATIONS (@silent): these are progress notes, no ping.
-  for (const block of blocks) {
-    const full = `🖥️ ${block}`
-    for (let i = 0; i < full.length && i < 3 * 1900; i += 1900) {
-      await api(`/channels/${targetId}/messages`, {
-        method: 'POST',
-        body: JSON.stringify({ content: full.slice(i, i + 1900), flags: 4096 }),
-      })
+  for (let b = 0; b < blocks.length; b++) {
+    const raw = blocks[b]
+    const mark = b === blocks.length - 1 ? finalMark : ''
+    const prefix = isAnswerFallback ? '' : '🖥️ '
+    const flags = isAnswerFallback ? 0 : 4096
+    if (hasTable(raw)) {
+      // Tables only align in the attachment preview — same delivery as the
+      // server's reply path.
+      const firstTableAt = raw.search(/^\s*\|.*\|\s*$/m)
+      const lead = (firstTableAt > 0 ? raw.slice(0, firstTableAt).trim() : '').slice(0, 400)
+      await postWithFile(
+        targetId,
+        { content: `${prefix}${lead ? lead + '\n' : ''}📄 full message attached${mark}`, flags },
+        'message.txt',
+        mdTablesToAscii(raw, true),
+      )
+    } else {
+      const full = `${prefix}${mdTablesToAscii(raw)}${mark}`
+      for (let i = 0; i < full.length && i < 3 * 1900; i += 1900) {
+        await postJson(targetId, { content: full.slice(i, i + 1900), flags })
+      }
     }
   }
 } catch (err) {
