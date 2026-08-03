@@ -1193,36 +1193,34 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const mode = access.chunkMode ?? 'length'
         const replyMode = access.replyToMode ?? 'first'
 
-        // Any reply containing a table becomes a short lead + an attached
-        // message.md (built from a buffer, no file on disk): the attachment
-        // preview is monospace and never wraps, so tables stay aligned at
-        // any width. Long table-free replies are NOT attached — they split
-        // into multiple messages on paragraph boundaries below.
+        // Tables never mix with prose: ALL surrounding text (before and
+        // after) goes out as normal paragraph-chunked messages, the tables
+        // alone ship as one attachment (monospace preview, never wraps),
+        // sent last with no label — the file speaks for itself.
         const original = args.text as string
-        const containsTable = /^\s*\|[\s:|-]+\|\s*$/m.test(original)
-        if (containsTable) {
-          // Everything before the first table goes in the message; the
-          // attachment holds only the rest — no duplicated text.
-          const firstTableAt = original.search(/^\s*\|.*\|\s*$/m)
-          const leadText = firstTableAt > 0 ? original.slice(0, firstTableAt).trim() : ''
-          const rest = firstTableAt > 0 ? original.slice(firstTableAt) : original
-          const lead = `${leadText}${leadText ? '\n' : ''}📄 table attached`
-          const sent = await ch.send({
-            content: lead.slice(0, 1900),
-            files: [
-              new AttachmentBuilder(Buffer.from(mdTablesToAscii(rest, true), 'utf8'), { name: 'message.txt' }),
-              ...files.slice(0, 9),
-            ],
-            ...(reply_to != null && replyMode !== 'off'
-              ? { reply: { messageReference: reply_to, failIfNotExists: false } }
-              : {}),
-          })
-          noteSent(sent.id)
-          stopTyping(chat_id)
-          return { content: [{ type: 'text', text: `sent as attachment (id: ${sent.id})` }] }
+        let proseText = text
+        let tableFile: Buffer | null = null
+        if (/^\s*\|[\s:|-]+\|\s*$/m.test(original)) {
+          const src = original.split('\n')
+          const proseLines: string[] = []
+          const tableParts: string[] = []
+          let i2 = 0
+          while (i2 < src.length) {
+            if (/^\s*\|.*\|\s*$/.test(src[i2]) && i2 + 1 < src.length && /^\s*\|[\s:|-]+\|\s*$/.test(src[i2 + 1])) {
+              let j2 = i2
+              while (j2 < src.length && /^\s*\|.*\|\s*$/.test(src[j2])) j2++
+              tableParts.push(src.slice(i2, j2).join('\n'))
+              i2 = j2
+            } else {
+              proseLines.push(src[i2])
+              i2++
+            }
+          }
+          proseText = proseLines.join('\n').replace(/\n{3,}/g, '\n\n').trim()
+          tableFile = Buffer.from(tableParts.map(t => mdTablesToAscii(t, true)).join('\n\n'), 'utf8')
         }
 
-        const chunks = chunk(text, limit, mode)
+        const chunks = proseText ? chunk(proseText, limit, mode) : []
         const sentIds: string[] = []
 
         try {
@@ -1244,6 +1242,21 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err)
           throw new Error(`reply failed after ${sentIds.length} of ${chunks.length} chunk(s) sent: ${msg}`)
+        }
+
+        if (tableFile) {
+          const sent = await ch.send({
+            content: '',
+            files: [
+              new AttachmentBuilder(tableFile, { name: 'message.txt' }),
+              ...(chunks.length === 0 ? files.slice(0, 9) : []),
+            ],
+            ...(chunks.length === 0 && reply_to != null && replyMode !== 'off'
+              ? { reply: { messageReference: reply_to, failIfNotExists: false } }
+              : {}),
+          })
+          noteSent(sent.id)
+          sentIds.push(sent.id)
         }
 
         stopTyping(chat_id)

@@ -255,17 +255,30 @@ try {
     const prefix = isAnswerFallback ? '' : '🖥️ '
     const flags = isAnswerFallback ? 0 : 4096
     if (hasTable(raw)) {
-      // Tables only align in the attachment preview — same delivery as the
-      // server's reply path. Lead stays in the message, attachment holds
-      // only the rest, nothing duplicated.
-      const firstTableAt = raw.search(/^\s*\|.*\|\s*$/m)
-      const lead = (firstTableAt > 0 ? raw.slice(0, firstTableAt).trim() : '').slice(0, 1600)
-      const rest = firstTableAt > 0 ? raw.slice(firstTableAt) : raw
+      // Tables never mix with prose: surrounding text posts as a normal
+      // message, the tables alone ship as an unlabeled attachment.
+      const src = raw.split('\n')
+      const proseLines = []
+      const tableParts = []
+      let li = 0
+      while (li < src.length) {
+        if (/^\s*\|.*\|\s*$/.test(src[li]) && li + 1 < src.length && /^\s*\|[\s:|-]+\|\s*$/.test(src[li + 1])) {
+          let lj = li
+          while (lj < src.length && /^\s*\|.*\|\s*$/.test(src[lj])) lj++
+          tableParts.push(src.slice(li, lj).join('\n'))
+          li = lj
+        } else {
+          proseLines.push(src[li])
+          li++
+        }
+      }
+      const prose = proseLines.join('\n').replace(/\n{3,}/g, '\n\n').trim()
+      if (prose) await postJson(targetId, { content: `${prefix}${prose}`.slice(0, 1900), flags })
       await postWithFile(
         targetId,
-        { content: `${prefix}${lead ? lead + '\n' : ''}📄 table attached${mark}`, flags },
+        { content: `${prefix.trim()}${mark}`, flags },
         'message.txt',
-        mdTablesToAscii(rest, true),
+        tableParts.map(t => mdTablesToAscii(t, true)).join('\n\n'),
       )
     } else {
       const full = `${prefix}${mdTablesToAscii(raw)}${mark}`
