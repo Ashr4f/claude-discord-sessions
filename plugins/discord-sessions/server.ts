@@ -1201,14 +1201,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const original = args.text as string
         const containsTable = /^\s*\|[\s:|-]+\|\s*$/m.test(original)
         if (containsTable) {
-          const firstTableAt = containsTable ? original.search(/^\s*\|.*\|\s*$/m) : -1
-          const leadSrc = firstTableAt > 0 ? original.slice(0, firstTableAt) : original
-          const cut = leadSrc.indexOf('\n') > 0 && leadSrc.indexOf('\n') <= 400 ? leadSrc.indexOf('\n') : Math.min(400, leadSrc.length)
-          const lead = `${leadSrc.slice(0, cut).trimEnd() || '📄'}\n📄 full message attached`
+          // Everything before the first table goes in the message; the
+          // attachment holds only the rest — no duplicated text.
+          const firstTableAt = original.search(/^\s*\|.*\|\s*$/m)
+          const leadText = firstTableAt > 0 ? original.slice(0, firstTableAt).trim() : ''
+          const rest = firstTableAt > 0 ? original.slice(firstTableAt) : original
+          const lead = `${leadText}${leadText ? '\n' : ''}📄 table attached`
           const sent = await ch.send({
-            content: lead,
+            content: lead.slice(0, 1900),
             files: [
-              new AttachmentBuilder(Buffer.from(mdTablesToAscii(original, true), 'utf8'), { name: 'message.txt' }),
+              new AttachmentBuilder(Buffer.from(mdTablesToAscii(rest, true), 'utf8'), { name: 'message.txt' }),
               ...files.slice(0, 9),
             ],
             ...(reply_to != null && replyMode !== 'off'

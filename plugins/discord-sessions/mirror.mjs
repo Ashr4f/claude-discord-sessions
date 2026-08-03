@@ -256,14 +256,16 @@ try {
     const flags = isAnswerFallback ? 0 : 4096
     if (hasTable(raw)) {
       // Tables only align in the attachment preview — same delivery as the
-      // server's reply path.
+      // server's reply path. Lead stays in the message, attachment holds
+      // only the rest, nothing duplicated.
       const firstTableAt = raw.search(/^\s*\|.*\|\s*$/m)
-      const lead = (firstTableAt > 0 ? raw.slice(0, firstTableAt).trim() : '').slice(0, 400)
+      const lead = (firstTableAt > 0 ? raw.slice(0, firstTableAt).trim() : '').slice(0, 1600)
+      const rest = firstTableAt > 0 ? raw.slice(firstTableAt) : raw
       await postWithFile(
         targetId,
-        { content: `${prefix}${lead ? lead + '\n' : ''}📄 full message attached${mark}`, flags },
+        { content: `${prefix}${lead ? lead + '\n' : ''}📄 table attached${mark}`, flags },
         'message.txt',
-        mdTablesToAscii(raw, true),
+        mdTablesToAscii(rest, true),
       )
     } else {
       const full = `${prefix}${mdTablesToAscii(raw)}${mark}`
