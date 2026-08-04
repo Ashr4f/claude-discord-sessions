@@ -208,9 +208,13 @@ function mdTablesToAscii(text, forFile = false) {
 
 // When the turn ends with NO real reply, the mirrored content IS the answer:
 // deliver it as a normal message (ping, no 🖥️ prefix) instead of a silent
-// system note. Mid-turn narration and leftovers next to a real reply stay
-// silent progress notes.
+// system note.
 const isAnswerFallback = hook.hook_event_name === 'Stop' && discordSentTexts.length === 0
+// When the turn DID reply, leftover final terminal text is a parallel
+// version of the same answer (different wording, other language, insight
+// blocks) — text-matching can't dedupe that, so the end-of-turn run posts
+// nothing. Genuine narration still streams live from the PostToolUse runs.
+if (hook.hook_event_name === 'Stop' && discordSentTexts.length > 0) process.exit(0)
 const blocks = fresh.filter(t => t.trim())
 if (blocks.length === 0) process.exit(0)
 // The final Stop-hook post carries an invisible marker (U+2063) so the
