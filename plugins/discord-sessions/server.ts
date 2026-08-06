@@ -146,6 +146,10 @@ let manualBind = false
 // ask_user questions follow the conversation instead of always landing in
 // the parent channel.
 let lastChatId: string | null = null
+// Parent channel of lastChatId when it's a thread (null otherwise). Lets the
+// reply tool detect a stale chat_id that points at the parent while the
+// conversation moved into a thread.
+let lastChatParentId: string | null = null
 
 // The SessionStart hook (the plugin's session-map.mjs hook) writes
 // sessions/<pid>.json for the Claude process and its ancestors. We walk our
@@ -1171,7 +1175,22 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   try {
     switch (req.params.name) {
       case 'reply': {
-        const chat_id = args.chat_id as string
+        let chat_id = args.chat_id as string
+        // LOCAL PATCH: snap the reply to where the user actually spoke last.
+        // The model sometimes reuses a stale chat_id from earlier context —
+        // typically the parent channel after the user opened a thread. When
+        // the given id and lastChatId are parent/thread of each other, the
+        // conversation channel (lastChatId) wins.
+        if (lastChatId && chat_id !== lastChatId) {
+          if (chat_id === lastChatParentId) {
+            chat_id = lastChatId
+          } else {
+            try {
+              const given = await client.channels.fetch(chat_id)
+              if (given?.isThread() && given.parentId === lastChatId) chat_id = lastChatId
+            } catch {}
+          }
+        }
         const text = mdTablesToAscii(args.text as string)
         const reply_to = args.reply_to as string | undefined
         const files = (args.files as string[] | undefined) ?? []
@@ -1747,6 +1766,7 @@ async function handleInbound(msg: Message): Promise<void> {
   // LOCAL PATCH: typing indicator kept alive while the session works.
   startTyping(msg.channel, msg.channelId)
   lastChatId = msg.channelId
+  lastChatParentId = msg.channel.isThread() ? (msg.channel.parentId ?? null) : null
 
   // Ack reaction — lets the user know we're processing. Fire-and-forget.
   const access = result.access
