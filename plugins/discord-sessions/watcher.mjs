@@ -357,9 +357,10 @@ const CLAUDE_ARGS = ['--channels', 'plugin:discord@claude-plugins-official']
 // stays hidden — verified working. A direct bun spawn (detached+windowsHide)
 // gives no console at all and the TUI dies instantly; bun's execFileSync
 // throws spurious ETIMEDOUT — hence async spawn of a PowerShell middleman.
-function spawnClaudeWindows(cwd, channelName, resumeId) {
+function spawnClaudeWindows(cwd, channelName, resumeId, model) {
   const args = CLAUDE_ARGS.map(psQuote)
   if (resumeId) args.push("'--resume'", psQuote(resumeId))
+  if (model) args.push("'--model'", psQuote(model))
   const script =
     `$env:DISCORD_CHANNEL=${psQuote(channelName)}; $env:DISCORD_WAKE='1'; ` +
     `$p = Start-Process -FilePath ${psQuote(CLAUDE_EXE)} -ArgumentList @(${args.join(', ')}) ` +
@@ -395,9 +396,10 @@ function spawnClaudeWindows(cwd, channelName, resumeId) {
 // Linux/macOS: the TUI needs a pty; `script` allocates one without any native
 // dependency. Detached so the whole tree lives in its own process group and
 // killTree can take it down with kill(-pid).
-function spawnClaudePosix(cwd, channelName, resumeId) {
+function spawnClaudePosix(cwd, channelName, resumeId, model) {
   const args = [...CLAUDE_ARGS]
   if (resumeId) args.push('--resume', resumeId)
+  if (model) args.push('--model', model)
   const env = { ...process.env, DISCORD_CHANNEL: channelName, DISCORD_WAKE: '1' }
   const shQuote = s => `'${String(s).replace(/'/g, "'\\''")}'`
   const child =
@@ -414,8 +416,10 @@ function spawnClaudePosix(cwd, channelName, resumeId) {
   return Promise.resolve(child.pid)
 }
 
-function spawnClaude(cwd, channelName, resumeId) {
-  return IS_WIN ? spawnClaudeWindows(cwd, channelName, resumeId) : spawnClaudePosix(cwd, channelName, resumeId)
+function spawnClaude(cwd, channelName, resumeId, model) {
+  return IS_WIN
+    ? spawnClaudeWindows(cwd, channelName, resumeId, model)
+    : spawnClaudePosix(cwd, channelName, resumeId, model)
 }
 
 // Async spawn, not execFileSync — bun's sync exec throws spurious ETIMEDOUT
@@ -532,7 +536,7 @@ async function wake(channelId, channelName, msg) {
 
   let pid
   try {
-    pid = await spawnClaude(cwd, channelName, resumeId)
+    pid = await spawnClaude(cwd, channelName, resumeId, state.modelOverrides?.[channelId])
   } catch (err) {
     log(`#${channelName}: spawn failed: ${err}`)
     removeHourglass(msg)
@@ -563,6 +567,7 @@ const HELP_TEXT = [
   '`/killall` — stop all background sessions',
   '`/restart` — restart background session(s) (`all` or one channel)',
   '`/open` / `/hide` — show a background session\'s live terminal on the PC screen / tuck it away',
+  '`/model` — show this channel\'s model, or switch it (applies live to a background session)',
   '`/update` — update Claude Code itself',
   '`/status` — watcher uptime, Claude version, idle timers',
   '`/logs` — recent watcher log lines',
@@ -613,7 +618,7 @@ async function restartOne(cid, s) {
   }
   indexSessions()
   const sess = findSessionByName(s.channelName)
-  const pid = await spawnClaude(sess?.cwd ?? s.cwd, s.channelName, sess?.sessionId ?? null)
+  const pid = await spawnClaude(sess?.cwd ?? s.cwd, s.channelName, sess?.sessionId ?? null, state.modelOverrides?.[cid])
   state.spawned[cid] = { ...s, pid, spawnedAt: Date.now(), lastActivity: Date.now() }
   saveState()
 }
@@ -832,7 +837,7 @@ async function spawnForChannel(channelId, channelName) {
   const sess = findSessionByName(channelName)
   const cwd = canonPath(sess?.cwd ?? config.defaultDir ?? HOME)
   if (!isTrusted(cwd)) return { ok: false, cwd }
-  const pid = await spawnClaude(cwd, channelName, sess?.sessionId ?? null)
+  const pid = await spawnClaude(cwd, channelName, sess?.sessionId ?? null, state.modelOverrides?.[channelId])
   state.spawned[channelId] = { pid, channelName, cwd, spawnedAt: Date.now(), lastActivity: Date.now() }
   saveState()
   log(`#${channelName}: spawned claude pid ${pid} for injected command`)
@@ -875,6 +880,62 @@ function logsText() {
 function sessionsText() {
   const rows = listLive()
   return rows.length > 0 ? '**Live sessions:**\n' + rows.join('\n') : 'No live sessions.'
+}
+
+// ── per-channel model override ──────────────────────────────────────────────
+const MODEL_MAP = {
+  fable: 'claude-fable-5',
+  opus: 'claude-opus-5',
+  sonnet: 'claude-sonnet-5',
+  haiku: 'claude-haiku-4-5-20251001',
+}
+
+// Last model that actually answered in the channel's session (transcript tail).
+function currentModelForChannel(channelName) {
+  const hit = Object.entries(state.index)
+    .filter(([, e]) => e.title && slugify(e.title) === channelName)
+    .sort(([, a], [, b]) => b.mtimeMs - a.mtimeMs)[0]
+  if (!hit) return null
+  try {
+    const tail = readTail(hit[0], 512 * 1024)
+    const ms = [...tail.matchAll(/"model":"(claude-[a-z0-9.-]+)"/g)]
+    return ms.length > 0 ? ms[ms.length - 1][1] : null
+  } catch {
+    return null
+  }
+}
+
+async function modelText(channelName, channelId, choice) {
+  state.modelOverrides = state.modelOverrides ?? {}
+  if (!choice) {
+    indexSessions()
+    const cur = currentModelForChannel(channelName)
+    const override = state.modelOverrides[channelId]
+    return [
+      `#${channelName}:`,
+      `Last model that answered: ${cur ? `\`${cur}\`` : 'unknown (no session history found)'}`,
+      `Override for wakes: ${override ? `\`${override}\`` : 'none (account default)'}`,
+    ].join('\n')
+  }
+  if (choice === 'default') {
+    delete state.modelOverrides[channelId]
+    saveState()
+  } else {
+    state.modelOverrides[channelId] = MODEL_MAP[choice] ?? choice
+    saveState()
+  }
+  const target = state.modelOverrides[channelId]
+  let note = 'Applies from the next wake.'
+  const running = state.spawned[channelId]
+  if (running && pidAlive(running.pid)) {
+    try {
+      await restartOne(channelId, running)
+      note = 'Background session restarted with it, conversation kept.'
+    } catch (err) {
+      note = `⚠️ Restart failed (${err.message}) — applies on next wake.`
+    }
+  }
+  return `Model for #${channelName}: ${target ? `\`${target}\`` : 'account default'}. ${note}`
 }
 
 // Show/hide the hidden console window of a background session (Windows).
@@ -1263,6 +1324,19 @@ client.on('interactionCreate', async i => {
           await i.editReply(await openText(i.options.getString('channel', true), 'hide'))
           return
         }
+        case 'model': {
+          await i.deferReply()
+          const ch = i.channel
+          const isThread = typeof ch?.isThread === 'function' && ch.isThread()
+          const channelId = isThread ? (ch.parentId ?? i.channelId) : i.channelId
+          const channelName = isThread ? ch.parent?.name : ch?.name
+          if (!channelName) {
+            await i.editReply('Could not resolve this channel.')
+            return
+          }
+          await i.editReply(await modelText(channelName, channelId, i.options.getString('set') ?? null))
+          return
+        }
       }
       return
     }
@@ -1339,6 +1413,25 @@ client.once('ready', c => {
             description: "Hide a background session's terminal window again",
             options: [
               { type: 3, name: 'channel', description: 'Which background session', required: true, autocomplete: true },
+            ],
+          },
+          {
+            name: 'model',
+            description: "Show or switch this channel's model",
+            options: [
+              {
+                type: 3,
+                name: 'set',
+                description: 'Leave empty to just show the current model',
+                required: false,
+                choices: [
+                  { name: 'Fable 5', value: 'fable' },
+                  { name: 'Opus 5', value: 'opus' },
+                  { name: 'Sonnet 5', value: 'sonnet' },
+                  { name: 'Haiku 4.5', value: 'haiku' },
+                  { name: 'account default', value: 'default' },
+                ],
+              },
             ],
           },
         ],
