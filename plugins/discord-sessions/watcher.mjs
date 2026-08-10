@@ -34,6 +34,7 @@ import {
   readSync,
   closeSync,
   appendFileSync,
+  realpathSync,
 } from 'fs'
 import { homedir } from 'os'
 import { join, basename } from 'path'
@@ -315,13 +316,25 @@ try {
 // A hidden session can't answer the first-run trust dialog, so we only spawn
 // in folders the user has already trusted from a real terminal (read-only
 // check of ~/.claude.json — the watcher never modifies trust itself).
+// Windows paths are case-insensitive but .claude.json keys are not:
+// "C:/Users/x/repo" (trusted) and "c:/Users/x/repo" (untrusted twin) coexist.
+// Canonicalize to the on-disk casing so spawns run under the trusted identity.
+function canonPath(p) {
+  try {
+    return (realpathSync.native ?? realpathSync)(p)
+  } catch {
+    return p
+  }
+}
+
 function isTrusted(dir) {
   try {
     const j = JSON.parse(readFileSync(join(HOME, '.claude.json'), 'utf8'))
-    const key = dir.replace(/\\/g, '/')
-    const alt = dir.replace(/\//g, '\\')
-    const p = j.projects ?? {}
-    return !!(p[key]?.hasTrustDialogAccepted || p[alt]?.hasTrustDialogAccepted || p[dir]?.hasTrustDialogAccepted)
+    const want = dir.replace(/\\/g, '/').toLowerCase()
+    for (const [k, v] of Object.entries(j.projects ?? {})) {
+      if (k.replace(/\\/g, '/').toLowerCase() === want && v?.hasTrustDialogAccepted) return true
+    }
+    return false
   } catch {
     return false
   }
@@ -455,11 +468,11 @@ async function wake(channelId, channelName, msg) {
   const sess = findSessionByName(channelName)
   let cwd, resumeId
   if (sess) {
-    cwd = sess.cwd
+    cwd = canonPath(sess.cwd)
     resumeId = sess.sessionId
     log(`#${channelName}: resuming session ${resumeId} in ${cwd}`)
   } else {
-    cwd = extractPath(msg.content) ?? config.defaultDir ?? HOME
+    cwd = canonPath(extractPath(msg.content) ?? config.defaultDir ?? HOME)
     resumeId = null
     log(`#${channelName}: no known session, spawning fresh in ${cwd}`)
   }
@@ -773,7 +786,7 @@ function writeCommandFile(channelId, text, user) {
 async function spawnForChannel(channelId, channelName) {
   indexSessions()
   const sess = findSessionByName(channelName)
-  const cwd = sess?.cwd ?? config.defaultDir ?? HOME
+  const cwd = canonPath(sess?.cwd ?? config.defaultDir ?? HOME)
   if (!isTrusted(cwd)) return { ok: false, cwd }
   const pid = await spawnClaude(cwd, channelName, sess?.sessionId ?? null)
   state.spawned[channelId] = { pid, channelName, cwd, spawnedAt: Date.now(), lastActivity: Date.now() }
