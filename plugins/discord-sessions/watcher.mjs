@@ -374,12 +374,31 @@ function spawnClaude(cwd, channelName, resumeId) {
   })
 }
 
+// Async spawn, not execFileSync — bun's sync exec throws spurious ETIMEDOUT
+// under a busy event loop (this bug hit spawnClaude first, then this).
 function killTree(pid) {
-  try {
-    execFileSync('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { encoding: 'utf8', timeout: 15_000 })
-  } catch (err) {
-    log(`taskkill ${pid} failed: ${err}`)
-  }
+  return new Promise(resolve => {
+    let done = false
+    const finish = () => {
+      if (!done) {
+        done = true
+        resolve()
+      }
+    }
+    const p = spawn('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+    p.on('close', finish)
+    p.on('error', err => {
+      log(`taskkill ${pid} failed: ${err}`)
+      finish()
+    })
+    const t = setTimeout(() => {
+      try {
+        p.kill()
+      } catch {}
+      finish()
+    }, 15_000)
+    t.unref?.()
+  })
 }
 
 // ── path extraction from a first message ────────────────────────────────────
@@ -497,10 +516,10 @@ const HELP_TEXT = [
 const STARTED_AT = Date.now()
 let cachedVersion = null
 
-function killAllSpawned() {
+async function killAllSpawned() {
   const entries = Object.entries(state.spawned)
   for (const [cid, s] of entries) {
-    if (pidAlive(s.pid)) killTree(s.pid)
+    if (pidAlive(s.pid)) await killTree(s.pid)
     delete state.spawned[cid]
   }
   try {
@@ -523,15 +542,19 @@ async function killOne(msg, name) {
     return
   }
   const [cid, s] = hit
-  if (pidAlive(s.pid)) killTree(s.pid)
+  if (pidAlive(s.pid)) await killTree(s.pid)
   delete state.spawned[cid]
   saveState()
   await msg.reply(`🛑 Stopped the background session on #${s.channelName}.`)
 }
 
 async function restartOne(cid, s) {
-  if (pidAlive(s.pid)) killTree(s.pid)
+  if (pidAlive(s.pid)) await killTree(s.pid)
   await new Promise(r => setTimeout(r, 2000))
+  if (pidAlive(s.pid)) {
+    log(`restart: pid ${s.pid} survived the kill, not spawning a duplicate`)
+    throw new Error(`could not stop the old session (pid ${s.pid})`)
+  }
   indexSessions()
   const sess = findSessionByName(s.channelName)
   const pid = await spawnClaude(sess?.cwd ?? s.cwd, s.channelName, sess?.sessionId ?? null)
@@ -550,8 +573,16 @@ async function restartCmd(msg, target) {
       await msg.reply('No background sessions to restart.')
       return
     }
-    for (const [cid, s] of entries) await restartOne(cid, s)
-    await msg.reply(`🔄 Restarted ${entries.length} background session(s).`)
+    const failed = []
+    for (const [cid, s] of entries) {
+      try {
+        await restartOne(cid, s)
+      } catch (err) {
+        failed.push(`#${s.channelName}: ${err.message}`)
+      }
+    }
+    const ok = entries.length - failed.length
+    await msg.reply(`🔄 Restarted ${ok} background session(s).${failed.length > 0 ? '\n⚠️ ' + failed.join('\n⚠️ ') : ''}`)
     return
   }
   const hit = findSpawnedByName(target)
@@ -559,7 +590,12 @@ async function restartCmd(msg, target) {
     await msg.reply(`No background session on \`#${target.replace(/^#/, '')}\`. Terminal sessions restart from their terminal.`)
     return
   }
-  await restartOne(hit[0], hit[1])
+  try {
+    await restartOne(hit[0], hit[1])
+  } catch (err) {
+    await msg.reply(`⚠️ Restart of #${hit[1].channelName} failed: ${err.message}`)
+    return
+  }
   await msg.reply(`🔄 Restarted the background session on #${hit[1].channelName}. It resumes its conversation.`)
 }
 
@@ -671,14 +707,15 @@ async function statusCmd(msg) {
   const up = Math.round((Date.now() - STARTED_AT) / 60000)
   const idleMs = Math.max(1, config.idleMinutes) * 60 * 1000
   const rows = [
-    `Watcher pid ${process.pid}, up ${Math.floor(up / 60)}h${up % 60}m — Claude ${cachedVersion}`,
+    `Watcher itself: up ${Math.floor(up / 60)}h${up % 60}m (sessions below have their own lifetimes) — Claude ${cachedVersion}`,
     `Idle shutdown: ${config.idleMinutes} min, default folder: ${config.defaultDir}`,
   ]
   const spawnedRows = Object.values(state.spawned)
     .filter(s => pidAlive(s.pid))
     .map(s => {
       const left = Math.max(0, Math.round((s.lastActivity + idleMs - Date.now()) / 60000))
-      return `#${s.channelName} — background, shuts down in ~${left} min of continued silence`
+      const age = Math.max(0, Math.round((Date.now() - s.spawnedAt) / 60000))
+      return `#${s.channelName} — \`${s.cwd}\` — background, up ${age} min, shuts down after ~${left} more min of silence`
     })
   const terminals = listLive().filter(r => r.includes('(terminal)'))
   rows.push(...(spawnedRows.length > 0 ? spawnedRows : ['No background sessions.']), ...terminals)
@@ -724,7 +761,7 @@ function listLive() {
     // The server stamps background:true when spawned by the watcher; fall
     // back to our spawned map for sessions predating that stamp.
     const bg = e.background || Object.values(state.spawned).some(s => s.channelName === e.channelName && pidAlive(s.pid))
-    rows.push(`#${e.channelName} — ${e.cwd} (${bg ? 'background' : 'terminal'})`)
+    rows.push(`#${e.channelName} — \`${e.cwd}\` (${bg ? 'background' : 'terminal'})`)
   }
   for (const s of Object.values(state.spawned)) {
     if (pidAlive(s.pid) && !rows.some(r => r.startsWith(`#${s.channelName} `))) {
@@ -795,7 +832,7 @@ client.on('messageCreate', async msg => {
     async function runCommand(name, arg, msg) {
       switch (name) {
         case 'killall': {
-          const n = killAllSpawned()
+          const n = await killAllSpawned()
           await msg.reply(`🛑 Stopped ${n} background session(s). Watcher still alive.`)
           return
         }
