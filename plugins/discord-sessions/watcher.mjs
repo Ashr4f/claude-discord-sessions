@@ -318,7 +318,12 @@ function psQuote(s) {
 // no console at all and the TUI dies instantly; bun's execFileSync throws
 // spurious ETIMEDOUT — hence async spawn of a PowerShell middleman.
 function spawnClaude(cwd, channelName, resumeId) {
-  const argList = resumeId ? `-ArgumentList @('--resume', ${psQuote(resumeId)})` : ''
+  // --channels is what makes Claude Code ACCEPT inbound channel notifications
+  // in this session; without it the bot binds and can send, but every inbound
+  // message is silently skipped (the wake message never arrives).
+  const args = ["'--channels'", "'plugin:discord@claude-plugins-official'"]
+  if (resumeId) args.push("'--resume'", psQuote(resumeId))
+  const argList = `-ArgumentList @(${args.join(', ')})`
   const script =
     `$env:DISCORD_CHANNEL=${psQuote(channelName)}; ` +
     `$p = Start-Process -FilePath ${psQuote(CLAUDE_EXE)} ${argList} ` +
