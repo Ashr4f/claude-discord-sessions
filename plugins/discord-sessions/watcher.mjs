@@ -275,22 +275,11 @@ function channelOwned(channelId, channelName) {
     }
     if (entry.channelId === channelId) owned = true
   }
-  if (owned) return true
-  // Fallback for sessions started before the live-registry patch: their
-  // server only appended to bind-log.txt. Latest bind per pid, pid alive.
-  if (channelName) {
-    try {
-      const tail = readTail(join(STATE_DIR, 'bind-log.txt'), 64 * 1024)
-      const byPid = new Map()
-      for (const m of tail.matchAll(/pid=(\d+) discord channel: session \S+ bound to #(\S+)/g)) {
-        byPid.set(Number(m[1]), m[2])
-      }
-      for (const [pid, name] of byPid) {
-        if (name === channelName && pidAlive(pid)) return true
-      }
-    } catch {}
-  }
-  return false
+  // No bind-log fallback here: it once matched a months-old "#general" line
+  // whose pid number had been recycled by an unrelated process, making the
+  // channel look owned forever. The live registry is authoritative — every
+  // current session writes it.
+  return owned
 }
 
 // ── spool: messages the woken session must answer once bound ───────────────
