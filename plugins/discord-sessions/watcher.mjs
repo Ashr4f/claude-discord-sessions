@@ -764,9 +764,9 @@ client.on('messageCreate', async msg => {
     const cmd = content.match(/^!([a-z]+)(?:\s+(.+))?$/i)
     if (cmd) {
       const [, name, arg] = cmd
-      // Working indicator for slow commands (!restart all, !update): gear
-      // reaction while the handler runs, removed when the reply is out.
-      const ackPromise = msg.react('⚙️').catch(() => null)
+      // Working indicator for slow commands (!restart all, !update):
+      // hourglass while the handler runs, removed when the reply is out.
+      const ackPromise = msg.react('⏳').catch(() => null)
       try {
         await runCommand(name.toLowerCase(), arg, msg)
       } finally {
