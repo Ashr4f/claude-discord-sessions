@@ -37,7 +37,7 @@ import {
 } from 'fs'
 import { homedir } from 'os'
 import { join, basename } from 'path'
-import { execFileSync } from 'child_process'
+import { execFileSync, spawn } from 'child_process'
 
 const HOME = homedir()
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(HOME, '.claude', 'channels', 'discord')
@@ -294,10 +294,6 @@ try {
 } catch {}
 
 // ── spawn / kill ────────────────────────────────────────────────────────────
-function psQuote(s) {
-  return `'${String(s).replace(/'/g, "''")}'`
-}
-
 // A hidden session can't answer the first-run trust dialog, so we only spawn
 // in folders the user has already trusted from a real terminal (read-only
 // check of ~/.claude.json — the watcher never modifies trust itself).
@@ -313,19 +309,46 @@ function isTrusted(dir) {
   }
 }
 
+function psQuote(s) {
+  return `'${String(s).replace(/'/g, "''")}'`
+}
+
+// Start-Process -WindowStyle Hidden gives claude a real console that stays
+// hidden — verified working. A direct bun spawn (detached+windowsHide) gives
+// no console at all and the TUI dies instantly; bun's execFileSync throws
+// spurious ETIMEDOUT — hence async spawn of a PowerShell middleman.
 function spawnClaude(cwd, channelName, resumeId) {
   const argList = resumeId ? `-ArgumentList @('--resume', ${psQuote(resumeId)})` : ''
   const script =
     `$env:DISCORD_CHANNEL=${psQuote(channelName)}; ` +
     `$p = Start-Process -FilePath ${psQuote(CLAUDE_EXE)} ${argList} ` +
     `-WorkingDirectory ${psQuote(cwd)} -WindowStyle Hidden -PassThru; $p.Id`
-  const out = execFileSync('powershell.exe', ['-NoProfile', '-Command', script], {
-    encoding: 'utf8',
-    timeout: 30_000,
+  return new Promise((resolve, reject) => {
+    const ps = spawn('powershell.exe', ['-NoProfile', '-Command', script], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    })
+    let out = ''
+    let err = ''
+    ps.stdout.on('data', d => (out += d))
+    ps.stderr.on('data', d => (err += d))
+    const t = setTimeout(() => {
+      try {
+        ps.kill()
+      } catch {}
+      reject(new Error('powershell spawn timed out'))
+    }, 30_000)
+    ps.on('error', e => {
+      clearTimeout(t)
+      reject(e)
+    })
+    ps.on('close', code => {
+      clearTimeout(t)
+      const pid = parseInt(out.trim(), 10)
+      if (Number.isFinite(pid)) resolve(pid)
+      else reject(new Error(`spawn failed (exit ${code}): ${out} ${err}`.trim()))
+    })
   })
-  const pid = parseInt(out.trim(), 10)
-  if (!Number.isFinite(pid)) throw new Error(`spawn returned no pid: ${out}`)
-  return pid
 }
 
 function killTree(pid) {
@@ -409,7 +432,17 @@ async function wake(channelId, channelName, msg) {
     return
   }
 
-  const pid = spawnClaude(cwd, channelName, resumeId)
+  let pid
+  try {
+    pid = await spawnClaude(cwd, channelName, resumeId)
+  } catch (err) {
+    log(`#${channelName}: spawn failed: ${err}`)
+    removeHourglass(msg)
+    try {
+      await msg.react('❌')
+    } catch {}
+    return
+  }
   clearHourglassWhenOwned(msg, channelId, channelName)
   state.spawned[channelId] = {
     pid,
