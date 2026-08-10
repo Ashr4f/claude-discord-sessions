@@ -568,6 +568,7 @@ const HELP_TEXT = [
   '`/restart` — restart background session(s) (`all` or one channel)',
   '`/open` / `/hide` — show a background session\'s live terminal on the PC screen / tuck it away',
   '`/model` — show this channel\'s model, or switch it (applies live to a background session)',
+  '`/rename` — rename the bot in this server',
   '`/update` — update Claude Code itself',
   '`/status` — watcher uptime, Claude version, idle timers',
   '`/logs` — recent watcher log lines',
@@ -1324,6 +1325,17 @@ client.on('interactionCreate', async i => {
           await i.editReply(await openText(i.options.getString('channel', true), 'hide'))
           return
         }
+        case 'rename': {
+          const nick = i.options.getString('name', true).trim().slice(0, 32)
+          try {
+            const me = await i.guild.members.fetchMe()
+            await me.setNickname(nick)
+            await i.reply(`Now answering as **${nick}** in this server.`)
+          } catch (err) {
+            await i.reply(`⚠️ Rename failed: ${err.message ?? err}`)
+          }
+          return
+        }
         case 'model': {
           await i.deferReply()
           const ch = i.channel
@@ -1413,6 +1425,13 @@ client.once('ready', c => {
             description: "Hide a background session's terminal window again",
             options: [
               { type: 3, name: 'channel', description: 'Which background session', required: true, autocomplete: true },
+            ],
+          },
+          {
+            name: 'rename',
+            description: 'Rename the bot in this server (per-server nickname)',
+            options: [
+              { type: 3, name: 'name', description: 'New display name (1-32 chars)', required: true },
             ],
           },
           {
