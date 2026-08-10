@@ -559,7 +559,7 @@ const HELP_TEXT = [
   '`/skill` — run a skill here (type to search the full list)',
   '`/sessions` — list live sessions (terminal + background)',
   '`/usage` — plan usage (5h + weekly limits; also always visible in my profile status)',
-  '`/kill` — stop one background session (autocompletes)',
+  '`/kill` — stop one background session (also the emergency stop: nothing is lost, your next message wakes it with full history)',
   '`/killall` — stop all background sessions',
   '`/restart` — restart background session(s) (`all` or one channel)',
   '`/open` / `/hide` — show a background session\'s live terminal on the PC screen / tuck it away',
