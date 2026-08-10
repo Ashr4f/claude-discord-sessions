@@ -711,6 +711,18 @@ client.on('messageCreate', async msg => {
           await msg.reply(rows.length > 0 ? '**Live sessions:**\n' + rows.join('\n') : 'No live sessions.')
           return
         }
+        case 'status':
+          await statusCmd(msg)
+          return
+        case 'logs':
+          await logsCmd(msg)
+          return
+        case 'status':
+          await statusCmd(msg)
+          return
+        case 'logs':
+          await logsCmd(msg)
+          return
         case 'help':
           await msg.reply(HELP_TEXT)
           return
