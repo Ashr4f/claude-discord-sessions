@@ -401,6 +401,7 @@ function clearHourglassWhenOwned(msg, channelId, channelName) {
 
 async function wake(channelId, channelName, msg) {
   spoolMessage(channelId, msg)
+  void maybePostHelp(msg.channel, channelId)
   try {
     await msg.react('⏳')
   } catch {}
@@ -461,6 +462,16 @@ async function wake(channelId, channelName, msg) {
 }
 
 // ── control commands ────────────────────────────────────────────────────────
+const HELP_TEXT = [
+  '**Claude session watcher** — talk normally and a session wakes for this channel. Commands:',
+  '`!sessions` — list live sessions (terminal + background)',
+  '`!kill <channel>` — stop that background session',
+  '`!killall` — stop all background sessions',
+  '`!restart <channel>` / `!restart all` — restart background session(s)',
+  '`!update` — update Claude Code itself',
+  '`!help` — this message',
+].join('\n')
+
 function killAllSpawned() {
   const entries = Object.entries(state.spawned)
   for (const [cid, s] of entries) {
@@ -473,6 +484,107 @@ function killAllSpawned() {
   waking.clear()
   saveState()
   return entries.length
+}
+
+function findSpawnedByName(name) {
+  const clean = name.replace(/^#/, '').toLowerCase()
+  return Object.entries(state.spawned).find(([, s]) => s.channelName.toLowerCase() === clean) ?? null
+}
+
+async function killOne(msg, name) {
+  const hit = findSpawnedByName(name)
+  if (!hit) {
+    await msg.reply(`No background session on \`#${name.replace(/^#/, '')}\`. Terminal sessions can only be closed from their terminal. \`!sessions\` shows what runs where.`)
+    return
+  }
+  const [cid, s] = hit
+  if (pidAlive(s.pid)) killTree(s.pid)
+  delete state.spawned[cid]
+  saveState()
+  await msg.reply(`🛑 Stopped the background session on #${s.channelName}.`)
+}
+
+async function restartOne(cid, s) {
+  if (pidAlive(s.pid)) killTree(s.pid)
+  await new Promise(r => setTimeout(r, 2000))
+  indexSessions()
+  const sess = findSessionByName(s.channelName)
+  const pid = await spawnClaude(sess?.cwd ?? s.cwd, s.channelName, sess?.sessionId ?? null)
+  state.spawned[cid] = { ...s, pid, spawnedAt: Date.now(), lastActivity: Date.now() }
+  saveState()
+}
+
+async function restartCmd(msg, target) {
+  if (!target) {
+    await msg.reply('Usage: `!restart <channel>` or `!restart all`')
+    return
+  }
+  if (target === 'all') {
+    const entries = Object.entries(state.spawned)
+    if (entries.length === 0) {
+      await msg.reply('No background sessions to restart.')
+      return
+    }
+    for (const [cid, s] of entries) await restartOne(cid, s)
+    await msg.reply(`🔄 Restarted ${entries.length} background session(s).`)
+    return
+  }
+  const hit = findSpawnedByName(target)
+  if (!hit) {
+    await msg.reply(`No background session on \`#${target.replace(/^#/, '')}\`. Terminal sessions restart from their terminal.`)
+    return
+  }
+  await restartOne(hit[0], hit[1])
+  await msg.reply(`🔄 Restarted the background session on #${hit[1].channelName}. It resumes its conversation.`)
+}
+
+function runClaude(args, timeoutMs) {
+  return new Promise(resolve => {
+    const p = spawn(CLAUDE_EXE, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+    let out = ''
+    p.stdout.on('data', d => (out += d))
+    p.stderr.on('data', d => (out += d))
+    const t = setTimeout(() => {
+      try {
+        p.kill()
+      } catch {}
+      resolve(out + '\n(timed out)')
+    }, timeoutMs)
+    p.on('close', () => {
+      clearTimeout(t)
+      resolve(out)
+    })
+    p.on('error', e => {
+      clearTimeout(t)
+      resolve(String(e))
+    })
+  })
+}
+
+async function updateCmd(msg) {
+  await msg.reply('⬆️ Updating Claude Code…')
+  const out = (await runClaude(['update'], 180_000)).trim()
+  const ver = (await runClaude(['--version'], 30_000)).trim()
+  const summary = out.split('\n').slice(-3).join('\n')
+  await msg.reply(`${summary || 'Done.'}\nCurrent version: ${ver}\nAlready-running sessions keep their version; background ones pick it up on their next wake (\`!restart all\` to force now).`)
+}
+
+// First contact with a fresh channel: post the command list and try to pin
+// it. Only once per channel, and only when the channel is (nearly) empty.
+async function maybePostHelp(channel, channelId) {
+  state.helpPosted = state.helpPosted ?? {}
+  if (state.helpPosted[channelId]) return
+  state.helpPosted[channelId] = true
+  saveState()
+  try {
+    const recent = await channel.messages.fetch({ limit: 6 })
+    const humanish = [...recent.values()].filter(m => !m.system)
+    if (humanish.length > 3) return
+    const sent = await channel.send(HELP_TEXT)
+    try {
+      await sent.pin()
+    } catch {}
+  } catch {}
 }
 
 function listLive() {
@@ -542,15 +654,36 @@ client.on('messageCreate', async msg => {
     if (!allowFrom.includes(msg.author.id)) return
 
     const content = (msg.content ?? '').trim()
-    if (content === '!killall') {
-      const n = killAllSpawned()
-      await msg.reply(`🛑 Stopped ${n} background session(s). Watcher still alive.`)
-      return
-    }
-    if (content === '!sessions') {
-      const rows = listLive()
-      await msg.reply(rows.length > 0 ? '**Live sessions:**\n' + rows.join('\n') : 'No live sessions.')
-      return
+    const cmd = content.match(/^!([a-z]+)(?:\s+(.+))?$/i)
+    if (cmd) {
+      const [, name, arg] = cmd
+      switch (name.toLowerCase()) {
+        case 'killall': {
+          const n = killAllSpawned()
+          await msg.reply(`🛑 Stopped ${n} background session(s). Watcher still alive.`)
+          return
+        }
+        case 'kill':
+          await killOne(msg, (arg ?? '').trim() || '?')
+          return
+        case 'restart':
+          await restartCmd(msg, (arg ?? '').trim().toLowerCase())
+          return
+        case 'update':
+          await updateCmd(msg)
+          return
+        case 'sessions': {
+          const rows = listLive()
+          await msg.reply(rows.length > 0 ? '**Live sessions:**\n' + rows.join('\n') : 'No live sessions.')
+          return
+        }
+        case 'help':
+          await msg.reply(HELP_TEXT)
+          return
+        default:
+          await msg.reply(`Unknown command \`!${name}\` — \`!help\` lists them.`)
+          return
+      }
     }
 
     if (waking.has(channelId)) {
@@ -580,6 +713,18 @@ client.on('messageCreate', async msg => {
 })
 
 client.on('error', err => log(`client error: ${err}`))
+
+// Freshly invited to a server: introduce the commands once, in the first
+// channel we can write to.
+client.on('guildCreate', async guild => {
+  try {
+    const chs = await guild.channels.fetch()
+    const target = [...chs.values()].find(c => c && c.type === 0 && c.viewable && 'send' in c)
+    if (target) await maybePostHelp(target, target.id)
+  } catch (err) {
+    log(`guildCreate help failed: ${err}`)
+  }
+})
 
 client.once('ready', c => {
   log(`watcher connected as ${c.user.tag} (pid ${process.pid}, idle ${config.idleMinutes}min, default ${config.defaultDir})`)

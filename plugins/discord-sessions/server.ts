@@ -1872,6 +1872,11 @@ async function handleInbound(msg: Message): Promise<void> {
     return
   }
 
+  // LOCAL PATCH: "!" messages are watcher control commands (!sessions,
+  // !kill, !restart, !update, !help) — the watcher answers them itself.
+  // The session must not see them: no typing, no delivery, no reaction.
+  if (/^![a-z]/i.test(msg.content ?? '')) return
+
   // LOCAL PATCH: dedupe across delivery paths (live gateway, early-drop
   // replay, wake spool) — a message reaches the session at most once.
   if (deliveredIds.has(msg.id)) return
