@@ -116,12 +116,16 @@ const requirePlugin = createRequire(join(pluginDir(), 'noop.js'))
 const { Client, GatewayIntentBits, Partials, ActionRowBuilder, StringSelectMenuBuilder } = requirePlugin('discord.js')
 
 // ── claude executable ───────────────────────────────────────────────────────
+const IS_WIN = process.platform === 'win32'
+
 function findClaude() {
   try {
-    const out = execFileSync('where.exe', ['claude'], { encoding: 'utf8' })
+    const out = execFileSync(IS_WIN ? 'where.exe' : 'which', ['claude'], { encoding: 'utf8' })
     const line = out.split(/\r?\n/).find(l => l.trim())
     if (line) return line.trim()
   } catch {}
+  const fallback = IS_WIN ? join(HOME, '.local', 'bin', 'claude.exe') : join(HOME, '.local', 'bin', 'claude')
+  if (existsSync(fallback)) return fallback
   throw new Error('claude executable not found on PATH')
 }
 const CLAUDE_EXE = findClaude()
@@ -344,20 +348,21 @@ function psQuote(s) {
   return `'${String(s).replace(/'/g, "''")}'`
 }
 
-// Start-Process -WindowStyle Hidden gives claude a real console that stays
-// hidden — verified working. A direct bun spawn (detached+windowsHide) gives
-// no console at all and the TUI dies instantly; bun's execFileSync throws
-// spurious ETIMEDOUT — hence async spawn of a PowerShell middleman.
-function spawnClaude(cwd, channelName, resumeId) {
-  // --channels is what makes Claude Code ACCEPT inbound channel notifications
-  // in this session; without it the bot binds and can send, but every inbound
-  // message is silently skipped (the wake message never arrives).
-  const args = ["'--channels'", "'plugin:discord@claude-plugins-official'"]
+// --channels is what makes Claude Code ACCEPT inbound channel notifications
+// in the woken session; without it the bot binds and can send, but every
+// inbound message is silently skipped (the wake message never arrives).
+const CLAUDE_ARGS = ['--channels', 'plugin:discord@claude-plugins-official']
+
+// Windows: Start-Process -WindowStyle Hidden gives claude a real console that
+// stays hidden — verified working. A direct bun spawn (detached+windowsHide)
+// gives no console at all and the TUI dies instantly; bun's execFileSync
+// throws spurious ETIMEDOUT — hence async spawn of a PowerShell middleman.
+function spawnClaudeWindows(cwd, channelName, resumeId) {
+  const args = CLAUDE_ARGS.map(psQuote)
   if (resumeId) args.push("'--resume'", psQuote(resumeId))
-  const argList = `-ArgumentList @(${args.join(', ')})`
   const script =
     `$env:DISCORD_CHANNEL=${psQuote(channelName)}; $env:DISCORD_WAKE='1'; ` +
-    `$p = Start-Process -FilePath ${psQuote(CLAUDE_EXE)} ${argList} ` +
+    `$p = Start-Process -FilePath ${psQuote(CLAUDE_EXE)} -ArgumentList @(${args.join(', ')}) ` +
     `-WorkingDirectory ${psQuote(cwd)} -WindowStyle Hidden -PassThru; $p.Id`
   return new Promise((resolve, reject) => {
     const ps = spawn('powershell.exe', ['-NoProfile', '-Command', script], {
@@ -387,9 +392,46 @@ function spawnClaude(cwd, channelName, resumeId) {
   })
 }
 
+// Linux/macOS: the TUI needs a pty; `script` allocates one without any native
+// dependency. Detached so the whole tree lives in its own process group and
+// killTree can take it down with kill(-pid).
+function spawnClaudePosix(cwd, channelName, resumeId) {
+  const args = [...CLAUDE_ARGS]
+  if (resumeId) args.push('--resume', resumeId)
+  const env = { ...process.env, DISCORD_CHANNEL: channelName, DISCORD_WAKE: '1' }
+  const shQuote = s => `'${String(s).replace(/'/g, "'\\''")}'`
+  const child =
+    process.platform === 'darwin'
+      ? spawn('script', ['-q', '/dev/null', CLAUDE_EXE, ...args], { cwd, env, detached: true, stdio: 'ignore' })
+      : spawn('script', ['-qefc', [CLAUDE_EXE, ...args].map(shQuote).join(' '), '/dev/null'], {
+          cwd,
+          env,
+          detached: true,
+          stdio: 'ignore',
+        })
+  child.unref()
+  if (!child.pid) throw new Error('spawn failed: no pid')
+  return Promise.resolve(child.pid)
+}
+
+function spawnClaude(cwd, channelName, resumeId) {
+  return IS_WIN ? spawnClaudeWindows(cwd, channelName, resumeId) : spawnClaudePosix(cwd, channelName, resumeId)
+}
+
 // Async spawn, not execFileSync — bun's sync exec throws spurious ETIMEDOUT
 // under a busy event loop (this bug hit spawnClaude first, then this).
 function killTree(pid) {
+  if (!IS_WIN) {
+    // Detached spawn = own process group: negative pid kills the whole tree.
+    try {
+      process.kill(-pid, 'SIGKILL')
+    } catch {
+      try {
+        process.kill(pid, 'SIGKILL')
+      } catch {}
+    }
+    return Promise.resolve()
+  }
   return new Promise(resolve => {
     let done = false
     const finish = () => {
@@ -516,6 +558,7 @@ const HELP_TEXT = [
   '**Claude session watcher** — talk normally and a session wakes for this channel. Slash commands:',
   '`/skill` — run a skill here (type to search the full list)',
   '`/sessions` — list live sessions (terminal + background)',
+  '`/usage` — plan usage (5h + weekly limits; also always visible in my profile status)',
   '`/kill` — stop one background session (autocompletes)',
   '`/killall` — stop all background sessions',
   '`/restart` — restart background session(s) (`all` or one channel)',
@@ -800,9 +843,13 @@ async function statusText() {
   const up = Math.round((Date.now() - STARTED_AT) / 60000)
   const idleMs = Math.max(1, config.idleMinutes) * 60 * 1000
   const rows = [
-    `Watcher itself: up ${Math.floor(up / 60)}h${up % 60}m (sessions below have their own lifetimes) — Claude ${cachedVersion}`,
-    `Idle shutdown: ${config.idleMinutes} min, default folder: ${config.defaultDir}`,
+    `**Watcher** — up ${Math.floor(up / 60)}h${up % 60}m (pid ${process.pid}, ${process.platform}) — Claude ${cachedVersion}`,
+    `Idle shutdown: ${config.idleMinutes} min · default folder: \`${config.defaultDir}\` · guild: ${routing.guildId ?? 'any'}`,
   ]
+  try {
+    rows.push('', await usageText())
+  } catch {}
+  rows.push('', '**Sessions**')
   const spawnedRows = Object.values(state.spawned)
     .filter(s => pidAlive(s.pid))
     .map(s => {
@@ -828,6 +875,74 @@ function sessionsText() {
   const rows = listLive()
   return rows.length > 0 ? '**Live sessions:**\n' + rows.join('\n') : 'No live sessions.'
 }
+
+// ── plan usage: same data as the TUI /usage, via Claude Code's own OAuth ───
+// token (read-only; token refresh stays Claude Code's job — on 401 we just
+// say so instead of touching the refresh flow).
+async function fetchUsage() {
+  const cred = readJson(join(HOME, '.claude', '.credentials.json'), {})?.claudeAiOauth
+  if (!cred?.accessToken) throw new Error('no Claude credentials found')
+  const r = await fetch('https://api.anthropic.com/api/oauth/usage', {
+    headers: { Authorization: `Bearer ${cred.accessToken}`, 'anthropic-beta': 'oauth-2025-04-20' },
+  })
+  if (r.status === 401) throw new Error('Claude token expired — it refreshes automatically on any Claude activity, try again in a minute')
+  if (!r.ok) throw new Error(`usage endpoint returned ${r.status}`)
+  return r.json()
+}
+
+function resetsIn(iso) {
+  if (!iso) return ''
+  const ms = Date.parse(iso) - Date.now()
+  if (!(ms > 0)) return ''
+  const h = Math.floor(ms / 3600000)
+  const m = Math.round((ms % 3600000) / 60000)
+  return h >= 24 ? `resets in ${Math.floor(h / 24)}d${h % 24}h` : h > 0 ? `resets in ${h}h${String(m).padStart(2, '0')}` : `resets in ${m}min`
+}
+
+function usageBar(p) {
+  const f = Math.max(0, Math.min(10, Math.round(p / 10)))
+  return '█'.repeat(f) + '░'.repeat(10 - f)
+}
+
+async function usageText() {
+  const u = await fetchUsage()
+  const rows = ['**Plan usage**']
+  if (u.five_hour) rows.push(`Session (5h): \`${usageBar(u.five_hour.utilization)}\` ${u.five_hour.utilization}% — ${resetsIn(u.five_hour.resets_at)}`)
+  if (u.seven_day) rows.push(`Week (all models): \`${usageBar(u.seven_day.utilization)}\` ${u.seven_day.utilization}% — ${resetsIn(u.seven_day.resets_at)}`)
+  for (const l of u.limits ?? []) {
+    if (l.kind === 'weekly_scoped' && l.scope?.model?.display_name) {
+      rows.push(`Week (${l.scope.model.display_name}): \`${usageBar(l.percent)}\` ${l.percent}% — ${resetsIn(l.resets_at)}`)
+    }
+  }
+  const extra = u.extra_usage
+  if (extra?.is_enabled && extra.used_credits > 0) {
+    rows.push(`Extra credits used: ${(extra.used_credits / 10 ** (extra.decimal_places ?? 2)).toFixed(2)} ${extra.currency ?? ''}`)
+  }
+  return rows.join('\n')
+}
+
+// Bot presence shows the numbers all the time, refreshed every 10 min.
+let lastPresence = ''
+async function refreshPresence() {
+  try {
+    const u = await fetchUsage()
+    const parts = []
+    if (u.five_hour) parts.push(`5h ${u.five_hour.utilization}%`)
+    if (u.seven_day) parts.push(`wk ${u.seven_day.utilization}%`)
+    for (const l of u.limits ?? []) {
+      if (l.kind === 'weekly_scoped' && l.scope?.model?.display_name) parts.push(`${l.scope.model.display_name} ${l.percent}%`)
+    }
+    const r5 = resetsIn(u.five_hour?.resets_at).replace('resets in ', '↻')
+    const text = parts.join(' • ') + (r5 ? ` (${r5})` : '')
+    if (!text || text === lastPresence) return
+    lastPresence = text
+    client.user?.setPresence({ activities: [{ type: 4, name: 'usage', state: text }], status: 'online' })
+    log(`presence updated: ${text}`)
+  } catch (err) {
+    log(`presence refresh failed: ${err.message ?? err}`)
+  }
+}
+setInterval(() => void refreshPresence(), 10 * 60 * 1000).unref?.()
 
 // First contact with a fresh channel: post the command list and try to pin
 // it. Only once per channel, and only when the channel is (nearly) empty.
@@ -1064,6 +1179,16 @@ client.on('interactionCreate', async i => {
         case 'sessions':
           await i.reply(sessionsText())
           return
+        case 'usage': {
+          await i.deferReply()
+          try {
+            await i.editReply(await usageText())
+          } catch (err) {
+            await i.editReply(`⚠️ ${err.message ?? err}`)
+          }
+          void refreshPresence()
+          return
+        }
         case 'status': {
           await i.deferReply()
           await i.editReply(await statusText())
@@ -1139,6 +1264,7 @@ client.once('ready', c => {
             ],
           },
           { name: 'sessions', description: 'List live Claude sessions (terminal + background)' },
+          { name: 'usage', description: 'Plan usage: 5h session and weekly limits' },
           { name: 'status', description: 'Watcher status: uptime, Claude version, idle timers' },
           { name: 'logs', description: 'Recent watcher log lines' },
           { name: 'help', description: 'How the watcher works, all commands' },
@@ -1164,6 +1290,7 @@ client.once('ready', c => {
       .then(() => log('registered slash commands'))
       .catch(err => log(`slash command registration failed: ${err}`))
   }
+  void refreshPresence()
 })
 
 client.login(TOKEN).catch(err => {
