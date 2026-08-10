@@ -336,10 +336,12 @@ async function bindSessionChannel(): Promise<void> {
 const LIVE_DIR = join(STATE_DIR, 'live')
 const LIVE_FILE = join(LIVE_DIR, `${process.pid}.json`)
 const SPOOL_DIR = join(STATE_DIR, 'pending')
-let lastRegisteredChannelId: string | null = null
+let lastRegisteredKey: string | null = null
 
 function writeLiveRegistry(): void {
-  if (!boundChannelId || boundChannelId === lastRegisteredChannelId) return
+  if (!boundChannelId) return
+  const key = `${boundChannelId}:${sessionInfo?.sessionId ?? ''}`
+  if (key === lastRegisteredKey) return
   try {
     mkdirSync(LIVE_DIR, { recursive: true })
     writeFileSync(
@@ -353,7 +355,7 @@ function writeLiveRegistry(): void {
         boundAt: new Date().toISOString(),
       }),
     )
-    lastRegisteredChannelId = boundChannelId
+    lastRegisteredKey = key
   } catch {}
 }
 
@@ -376,18 +378,53 @@ async function deliverSpool(): Promise<void> {
   } catch {
     return
   }
-  for (const m of spool.messages ?? []) {
-    try {
-      const ch = await client.channels.fetch(m.chatId)
-      if (!ch || !ch.isTextBased() || !('messages' in ch)) continue
-      const msg = await ch.messages.fetch(m.messageId)
-      if (!msg || msg.author?.bot) continue
-      process.stderr.write(`discord channel: delivering spooled wake message ${m.messageId}\n`)
-      await handleInbound(msg as Message)
-    } catch (err) {
-      process.stderr.write(`discord channel: spool delivery failed for ${m.messageId}: ${err}\n`)
-    }
+  for (const m of spool.messages ?? []) void deliverSpooled(m, 1)
+}
+
+// A notification sent while Claude Code is still booting is silently
+// dropped (a woken session binds ~2s into a boot that takes much longer).
+// After delivering, verify the message tag actually reached the session's
+// transcript; if not, deliver again. Without a transcript path we can't
+// verify, so retries are capped lower to bound the double-answer risk.
+async function transcriptHasMessage(messageId: string): Promise<boolean | null> {
+  sessionInfo ??= findSessionInfo()
+  const p = sessionInfo?.transcriptPath
+  if (!p) return null
+  try {
+    const f = Bun.file(p)
+    const text = await f.slice(Math.max(0, f.size - 4 * 1024 * 1024)).text()
+    return text.includes(`message_id=\\"${messageId}\\"`) || text.includes(`message_id="${messageId}"`)
+  } catch {
+    return null
   }
+}
+
+async function deliverSpooled(m: { chatId: string; messageId: string }, attempt: number): Promise<void> {
+  try {
+    const ch = await client.channels.fetch(m.chatId)
+    if (!ch || !ch.isTextBased() || !('messages' in ch)) return
+    const msg = await ch.messages.fetch(m.messageId)
+    if (!msg || msg.author?.bot) return
+    process.stderr.write(`discord channel: delivering spooled wake message ${m.messageId} (attempt ${attempt})\n`)
+    await handleInbound(msg as Message)
+  } catch (err) {
+    process.stderr.write(`discord channel: spool delivery failed for ${m.messageId}: ${err}\n`)
+    return
+  }
+  const t = setTimeout(() => {
+    void (async () => {
+      const seen = await transcriptHasMessage(m.messageId)
+      if (seen === true) return
+      const max = seen === null ? 2 : 5
+      if (attempt >= max) {
+        process.stderr.write(`discord channel: giving up on spooled message ${m.messageId} after ${attempt} deliveries\n`)
+        return
+      }
+      deliveredIds.delete(m.messageId)
+      await deliverSpooled(m, attempt + 1)
+    })()
+  }, 30_000)
+  ;(t as any).unref?.()
 }
 // ── END LOCAL PATCH ──────────────────────────────────────────────────────
 
@@ -1891,6 +1928,10 @@ client.once('ready', c => {
   // then settle into the 30s cadence that picks up /rename mid-session.
   const rebind = async () => {
     try {
+      // Env-bound sessions return from resolveWantedChannel before session
+      // identity is looked up — resolve it here too (spool verification and
+      // the live registry need the transcript path / session id).
+      sessionInfo ??= findSessionInfo()
       await bindSessionChannel()
       if (boundChannelId) {
         writeLiveRegistry()
