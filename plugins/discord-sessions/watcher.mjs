@@ -351,6 +351,26 @@ function extractPath(text) {
 // ── wake ────────────────────────────────────────────────────────────────────
 const waking = new Set()
 
+function removeHourglass(msg) {
+  void msg.reactions
+    .resolve('⏳')
+    ?.users.remove(client.user.id)
+    .catch(() => {})
+}
+
+// Clear the ⏳ once the woken session actually owns the channel.
+function clearHourglassWhenOwned(msg, channelId, channelName) {
+  const deadline = Date.now() + 120_000
+  const timer = setInterval(() => {
+    if (channelOwned(channelId, channelName)) {
+      removeHourglass(msg)
+      clearInterval(timer)
+    } else if (Date.now() > deadline) {
+      clearInterval(timer)
+    }
+  }, 3_000)
+}
+
 async function wake(channelId, channelName, msg) {
   spoolMessage(channelId, msg)
   try {
@@ -361,6 +381,7 @@ async function wake(channelId, channelName, msg) {
   await new Promise(r => setTimeout(r, 2500))
   if (channelOwned(channelId, channelName)) {
     log(`#${channelName}: session appeared while waking, standing down (spool stays for it)`)
+    removeHourglass(msg)
     return
   }
 
@@ -379,6 +400,7 @@ async function wake(channelId, channelName, msg) {
 
   if (!isTrusted(cwd)) {
     log(`#${channelName}: ${cwd} not trusted, cannot wake a hidden session there`)
+    removeHourglass(msg)
     try {
       await msg.reply(
         `⚠️ Can't wake a background session in \`${cwd}\`: that folder was never opened in Claude Code, so its one-time trust prompt is unanswered. Open a terminal there once (\`claude\`), accept the prompt, then message me again.`,
@@ -388,6 +410,7 @@ async function wake(channelId, channelName, msg) {
   }
 
   const pid = spawnClaude(cwd, channelName, resumeId)
+  clearHourglassWhenOwned(msg, channelId, channelName)
   state.spawned[channelId] = {
     pid,
     channelName,
