@@ -1035,6 +1035,16 @@ function noteAsk(id: string, questions: AskQuestion[]): void {
 
 // Injects a user answer into the session as if it were a typed channel message.
 function deliverAnswer(content: string, chatId: string, messageId: string, user: { username: string; id: string }): void {
+  // Button clicks and modal submissions must show "typing" like any typed
+  // message — the session is about to work on the answer.
+  void (async () => {
+    try {
+      const ch = await fetchTextChannel(chatId)
+      startTyping(ch as any, chatId)
+      lastChatParentId = (ch as any).isThread?.() ? ((ch as any).parentId ?? null) : null
+    } catch {}
+  })()
+  lastChatId = chatId
   void mcp.notification({
     method: 'notifications/claude/channel',
     params: {

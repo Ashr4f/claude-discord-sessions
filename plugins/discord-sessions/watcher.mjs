@@ -469,8 +469,14 @@ const HELP_TEXT = [
   '`!killall` — stop all background sessions',
   '`!restart <channel>` / `!restart all` — restart background session(s)',
   '`!update` — update Claude Code itself',
+  '`!status` — watcher uptime, Claude version, idle timers',
+  '`!logs` — recent watcher log lines',
   '`!help` — this message',
+  "Skills and slash-command work (like /daily) — just ask the session in its channel, it runs them itself.",
 ].join('\n')
+
+const STARTED_AT = Date.now()
+let cachedVersion = null
 
 function killAllSpawned() {
   const entries = Object.entries(state.spawned)
@@ -567,6 +573,34 @@ async function updateCmd(msg) {
   const ver = (await runClaude(['--version'], 30_000)).trim()
   const summary = out.split('\n').slice(-3).join('\n')
   await msg.reply(`${summary || 'Done.'}\nCurrent version: ${ver}\nAlready-running sessions keep their version; background ones pick it up on their next wake (\`!restart all\` to force now).`)
+}
+
+async function statusCmd(msg) {
+  if (!cachedVersion) cachedVersion = (await runClaude(['--version'], 30_000)).trim()
+  const up = Math.round((Date.now() - STARTED_AT) / 60000)
+  const idleMs = Math.max(1, config.idleMinutes) * 60 * 1000
+  const rows = [
+    `Watcher pid ${process.pid}, up ${Math.floor(up / 60)}h${up % 60}m — Claude ${cachedVersion}`,
+    `Idle shutdown: ${config.idleMinutes} min, default folder: ${config.defaultDir}`,
+  ]
+  const spawnedRows = Object.values(state.spawned)
+    .filter(s => pidAlive(s.pid))
+    .map(s => {
+      const left = Math.max(0, Math.round((s.lastActivity + idleMs - Date.now()) / 60000))
+      return `#${s.channelName} — background, shuts down in ~${left} min of continued silence`
+    })
+  const terminals = listLive().filter(r => r.includes('(terminal)'))
+  rows.push(...(spawnedRows.length > 0 ? spawnedRows : ['No background sessions.']), ...terminals)
+  await msg.reply(rows.join('\n'))
+}
+
+async function logsCmd(msg) {
+  let tail = ''
+  try {
+    tail = readTail(LOG_FILE, 16 * 1024)
+  } catch {}
+  const lines = tail.split('\n').filter(Boolean).slice(-12).join('\n')
+  await msg.reply(lines ? '```\n' + lines.slice(-1800) + '\n```' : 'Log is empty.')
 }
 
 // First contact with a fresh channel: post the command list and try to pin
