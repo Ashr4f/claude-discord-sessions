@@ -1290,7 +1290,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         if (!ROUTING || !boundChannelId) throw new Error('no bound channel — ask_user needs channel routing active')
         const intro = ((args.intro as string | undefined) ?? '').trim()
         const questions: AskQuestion[] = (args.questions as any[]).slice(0, 4).map(qq => ({
-          q: String(qq.q),
+          // Models sometimes send `question` instead of `q` (the AskUserQuestion
+          // built-in uses that name) — accept the alias instead of rendering
+          // "undefined" in the modal.
+          q: String(qq.q ?? qq.question ?? qq.label ?? ''),
           options: (qq.options as any[]).slice(0, 25).map(o =>
             typeof o === 'string'
               ? { label: o.slice(0, 100) }
