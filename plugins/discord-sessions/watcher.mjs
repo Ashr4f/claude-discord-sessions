@@ -178,6 +178,24 @@ function saveState() {
 for (const [cid, s] of Object.entries(state.spawned)) {
   if (!pidAlive(s.pid)) delete state.spawned[cid]
 }
+// Re-adopt background sessions we lost track of (watcher restarted, state
+// wiped): their servers stamp live/<pid>.json with background + claudePid.
+try {
+  for (const f of readdirSync(LIVE_DIR)) {
+    const e = readJson(join(LIVE_DIR, f), null)
+    if (!e?.background || !e.claudePid || !e.channelId) continue
+    if (!pidAlive(e.pid) || !pidAlive(e.claudePid)) continue
+    if (state.spawned[e.channelId] && pidAlive(state.spawned[e.channelId].pid)) continue
+    state.spawned[e.channelId] = {
+      pid: e.claudePid,
+      channelName: e.channelName,
+      cwd: e.cwd,
+      spawnedAt: Date.parse(e.boundAt) || Date.now(),
+      lastActivity: Date.now(),
+    }
+    log(`re-adopted background session #${e.channelName} (claude pid ${e.claudePid})`)
+  }
+} catch {}
 saveState()
 
 // ── session index: every transcript on the PC -> {title, cwd, sessionId} ───
@@ -325,7 +343,7 @@ function spawnClaude(cwd, channelName, resumeId) {
   if (resumeId) args.push("'--resume'", psQuote(resumeId))
   const argList = `-ArgumentList @(${args.join(', ')})`
   const script =
-    `$env:DISCORD_CHANNEL=${psQuote(channelName)}; ` +
+    `$env:DISCORD_CHANNEL=${psQuote(channelName)}; $env:DISCORD_WAKE='1'; ` +
     `$p = Start-Process -FilePath ${psQuote(CLAUDE_EXE)} ${argList} ` +
     `-WorkingDirectory ${psQuote(cwd)} -WindowStyle Hidden -PassThru; $p.Id`
   return new Promise((resolve, reject) => {
@@ -700,13 +718,12 @@ function listLive() {
   try {
     files = readdirSync(LIVE_DIR).filter(f => f.endsWith('.json'))
   } catch {}
-  const spawnedPids = new Set(Object.values(state.spawned).map(s => s.pid))
   for (const f of files) {
     const e = readJson(join(LIVE_DIR, f), null)
     if (!e || !pidAlive(e.pid)) continue
-    // A background session's live entry is written by its MCP server (child
-    // of the claude pid we spawned) — mark by channel instead of pid.
-    const bg = Object.values(state.spawned).some(s => s.channelName === e.channelName && pidAlive(s.pid))
+    // The server stamps background:true when spawned by the watcher; fall
+    // back to our spawned map for sessions predating that stamp.
+    const bg = e.background || Object.values(state.spawned).some(s => s.channelName === e.channelName && pidAlive(s.pid))
     rows.push(`#${e.channelName} — ${e.cwd} (${bg ? 'background' : 'terminal'})`)
   }
   for (const s of Object.values(state.spawned)) {

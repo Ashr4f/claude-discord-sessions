@@ -203,10 +203,16 @@ function parentChain(): number[] {
   }
 }
 
+// The claude.exe ancestor whose sessions/<pid>.json matched — the watcher
+// uses it to kill/adopt background sessions.
+let ownerClaudePid: number | null = null
+
 function findSessionInfo(): SessionInfo | null {
   for (const pid of parentChain().slice(1)) {
     try {
-      return JSON.parse(readFileSync(join(SESSIONS_DIR, `${pid}.json`), 'utf8')) as SessionInfo
+      const info = JSON.parse(readFileSync(join(SESSIONS_DIR, `${pid}.json`), 'utf8')) as SessionInfo
+      ownerClaudePid = pid
+      return info
     } catch {}
   }
   return null
@@ -353,6 +359,10 @@ function writeLiveRegistry(): void {
         sessionId: sessionInfo?.sessionId ?? null,
         cwd: SESSION_DIR,
         boundAt: new Date().toISOString(),
+        // Watcher-woken sessions carry DISCORD_WAKE=1; claudePid lets the
+        // watcher re-adopt them (idle-kill, !status) after its own restart.
+        background: process.env.DISCORD_WAKE === '1',
+        claudePid: ownerClaudePid,
       }),
     )
     lastRegisteredKey = key
