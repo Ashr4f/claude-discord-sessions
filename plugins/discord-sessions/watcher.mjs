@@ -764,7 +764,19 @@ client.on('messageCreate', async msg => {
     const cmd = content.match(/^!([a-z]+)(?:\s+(.+))?$/i)
     if (cmd) {
       const [, name, arg] = cmd
-      switch (name.toLowerCase()) {
+      // Working indicator for slow commands (!restart all, !update): gear
+      // reaction while the handler runs, removed when the reply is out.
+      const ackPromise = msg.react('⚙️').catch(() => null)
+      try {
+        await runCommand(name.toLowerCase(), arg, msg)
+      } finally {
+        void ackPromise.then(r => r?.users.remove(client.user.id)).catch(() => {})
+      }
+      return
+    }
+
+    async function runCommand(name, arg, msg) {
+      switch (name) {
         case 'killall': {
           const n = killAllSpawned()
           await msg.reply(`🛑 Stopped ${n} background session(s). Watcher still alive.`)
