@@ -112,7 +112,7 @@ function pluginDir() {
   return join(base, versions[0])
 }
 const requirePlugin = createRequire(join(pluginDir(), 'noop.js'))
-const { Client, GatewayIntentBits, Partials } = requirePlugin('discord.js')
+const { Client, GatewayIntentBits, Partials, ActionRowBuilder, StringSelectMenuBuilder } = requirePlugin('discord.js')
 
 // ── claude executable ───────────────────────────────────────────────────────
 function findClaude() {
@@ -471,6 +471,7 @@ const HELP_TEXT = [
   '`!update` — update Claude Code itself',
   '`!status` — watcher uptime, Claude version, idle timers',
   '`!logs` — recent watcher log lines',
+  '`!skills` — pick a skill from a list and run it in this channel',
   '`!help` — this message',
   "Skills and slash-command work (like /daily) — just ask the session in its channel, it runs them itself.",
 ].join('\n')
@@ -573,6 +574,78 @@ async function updateCmd(msg) {
   const ver = (await runClaude(['--version'], 30_000)).trim()
   const summary = out.split('\n').slice(-3).join('\n')
   await msg.reply(`${summary || 'Done.'}\nCurrent version: ${ver}\nAlready-running sessions keep their version; background ones pick it up on their next wake (\`!restart all\` to force now).`)
+}
+
+// User skills (~/.claude/skills/*/SKILL.md) + user commands (~/.claude/commands/*.md).
+function listSkills() {
+  const out = []
+  try {
+    for (const d of readdirSync(join(HOME, '.claude', 'skills'))) {
+      try {
+        const md = readFileSync(join(HOME, '.claude', 'skills', d, 'SKILL.md'), 'utf8')
+        const desc = md.match(/^description:\s*(.+)$/m)?.[1] ?? ''
+        out.push({ name: d, desc })
+      } catch {}
+    }
+  } catch {}
+  try {
+    for (const f of readdirSync(join(HOME, '.claude', 'commands'))) {
+      if (!f.endsWith('.md')) continue
+      const name = basename(f, '.md')
+      let desc = ''
+      try {
+        desc = readFileSync(join(HOME, '.claude', 'commands', f), 'utf8').match(/^description:\s*(.+)$/m)?.[1] ?? ''
+      } catch {}
+      out.push({ name, desc })
+    }
+  } catch {}
+  return out.slice(0, 25)
+}
+
+async function skillsCmd(msg) {
+  const skills = listSkills()
+  if (skills.length === 0) {
+    await msg.reply('No user skills found (~/.claude/skills, ~/.claude/commands).')
+    return
+  }
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId('runskill')
+    .setPlaceholder('Choose a skill to run')
+    .addOptions(
+      skills.map(s => ({
+        label: `/${s.name}`.slice(0, 100),
+        value: s.name.slice(0, 100),
+        ...(s.desc ? { description: s.desc.slice(0, 100) } : {}),
+      })),
+    )
+  await msg.reply({
+    content: 'Pick a skill — it runs in this channel\'s session (waking it if needed):',
+    components: [new ActionRowBuilder().addComponents(menu)],
+  })
+}
+
+// Write the instruction the session will pick up (commands/<channelId>.json,
+// polled by the patched server with verified retries).
+function writeCommandFile(channelId, text, user) {
+  const dir = join(STATE_DIR, 'commands')
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(
+    join(dir, `${channelId}.json`),
+    JSON.stringify({ id: `skillcmd-${Date.now()}`, text, attempts: 0, user: user.username, userId: user.id }),
+  )
+}
+
+// Spawn a session for a channel with no triggering message (skill picker).
+async function spawnForChannel(channelId, channelName) {
+  indexSessions()
+  const sess = findSessionByName(channelName)
+  const cwd = sess?.cwd ?? config.defaultDir ?? HOME
+  if (!isTrusted(cwd)) return { ok: false, cwd }
+  const pid = await spawnClaude(cwd, channelName, sess?.sessionId ?? null)
+  state.spawned[channelId] = { pid, channelName, cwd, spawnedAt: Date.now(), lastActivity: Date.now() }
+  saveState()
+  log(`#${channelName}: spawned claude pid ${pid} for injected command`)
+  return { ok: true, cwd }
 }
 
 async function statusCmd(msg) {
@@ -717,11 +790,8 @@ client.on('messageCreate', async msg => {
         case 'logs':
           await logsCmd(msg)
           return
-        case 'status':
-          await statusCmd(msg)
-          return
-        case 'logs':
-          await logsCmd(msg)
+        case 'skills':
+          await skillsCmd(msg)
           return
         case 'help':
           await msg.reply(HELP_TEXT)
@@ -746,6 +816,16 @@ client.on('messageCreate', async msg => {
     }
     if (!channelName) return
     if (channelOwned(channelId, channelName)) return
+    // A spawned session can take minutes to bind on a big resume — well past
+    // the 90s waking guard. As long as its pid is alive, never wake a second
+    // one: spool the message, the booting session picks it up on bind (the
+    // server re-reads the spool on every rebind tick).
+    const booting = state.spawned[channelId]
+    if (booting && pidAlive(booting.pid)) {
+      spoolMessage(channelId, msg)
+      log(`#${channelName}: session pid ${booting.pid} still booting, spooled ${msg.id} instead of double-waking`)
+      return
+    }
 
     waking.add(channelId)
     try {
@@ -759,6 +839,41 @@ client.on('messageCreate', async msg => {
 })
 
 client.on('error', err => log(`client error: ${err}`))
+
+client.on('interactionCreate', async i => {
+  try {
+    if (!i.isStringSelectMenu() || i.customId !== 'runskill') return
+    if (!allowFrom.includes(i.user.id)) {
+      await i.reply({ content: 'Not allowed.', ephemeral: true })
+      return
+    }
+    const skill = i.values[0]
+    const isThread = typeof i.channel?.isThread === 'function' && i.channel.isThread()
+    const channelId = isThread ? (i.channel.parentId ?? i.channelId) : i.channelId
+    const channelName = isThread ? i.channel.parent?.name : i.channel?.name
+    if (!channelName) {
+      await i.reply({ content: 'Could not resolve this channel.', ephemeral: true })
+      return
+    }
+    writeCommandFile(channelId, `Run the /${skill} skill now.`, i.user)
+    let note = ''
+    if (!channelOwned(channelId, channelName)) {
+      const r = await spawnForChannel(channelId, channelName)
+      if (!r.ok) {
+        await i.update({
+          content: `⚠️ Can't run /${skill}: folder \`${r.cwd}\` was never trusted from a terminal.`,
+          components: [],
+        })
+        return
+      }
+      note = ' (waking the session first, give it a moment)'
+    }
+    await i.update({ content: `▶️ /${skill} sent to #${channelName}${note}.`, components: [] })
+    log(`#${channelName}: skill /${skill} queued`)
+  } catch (err) {
+    log(`interaction error: ${err}`)
+  }
+})
 
 // Freshly invited to a server: introduce the commands once, in the first
 // channel we can write to.

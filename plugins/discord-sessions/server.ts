@@ -426,6 +426,50 @@ async function deliverSpooled(m: { chatId: string; messageId: string }, attempt:
   }, 30_000)
   ;(t as any).unref?.()
 }
+// commands/<channelId>.json — a synthetic instruction from the watcher (e.g.
+// the !skills picker) to inject into this session as if the user typed it.
+// Poll + verified-retry like the wake spool: the file survives until the
+// injected tag shows up in the transcript, so a boot-time drop self-heals.
+const CMD_DIR = join(STATE_DIR, 'commands')
+
+async function pollCommandFile(): Promise<void> {
+  if (!boundChannelId) return
+  const f = join(CMD_DIR, `${boundChannelId}.json`)
+  let cmd: { id?: string; text?: string; attempts?: number; lastAttempt?: number; user?: string; userId?: string }
+  try {
+    cmd = JSON.parse(readFileSync(f, 'utf8'))
+  } catch {
+    return
+  }
+  if (!cmd.id || !cmd.text) {
+    try {
+      rmSync(f)
+    } catch {}
+    return
+  }
+  if ((await transcriptHasMessage(cmd.id)) === true) {
+    try {
+      rmSync(f)
+    } catch {}
+    return
+  }
+  const now = Date.now()
+  if ((cmd.attempts ?? 0) >= 5) {
+    process.stderr.write(`discord channel: giving up on injected command ${cmd.id}\n`)
+    try {
+      rmSync(f)
+    } catch {}
+    return
+  }
+  if (cmd.lastAttempt && now - cmd.lastAttempt < 30_000) return
+  cmd.attempts = (cmd.attempts ?? 0) + 1
+  cmd.lastAttempt = now
+  try {
+    writeFileSync(f, JSON.stringify(cmd))
+  } catch {}
+  process.stderr.write(`discord channel: injecting watcher command ${cmd.id} (attempt ${cmd.attempts})\n`)
+  deliverAnswer(cmd.text, boundChannelId, cmd.id, { username: cmd.user ?? 'watcher', id: cmd.userId ?? '' })
+}
 // ── END LOCAL PATCH ──────────────────────────────────────────────────────
 
 type PendingEntry = {
@@ -1794,12 +1838,13 @@ client.on('interactionCreate', async (interaction: Interaction) => {
 })
 
 client.on('messageCreate', msg => {
-  // Our own messages: a real reply stops the typing indicator, but a live
-  // mirror post (🖥️, streamed mid-turn) must not — Claude is still working.
-  // The mirror's final Stop-hook post carries an invisible marker (U+2063)
-  // and does stop it, so a turn that ends without a reply can't hang.
+  // Bot-account messages: only a post THIS process sent (or the mirror's
+  // final Stop-hook post, marked with invisible U+2063) stops the typing
+  // indicator. The same bot account also posts from the watcher (!command
+  // replies) and from other sessions' servers — those must not stop it,
+  // Claude here is still working.
   if (msg.author.id === client.user?.id) {
-    if (!msg.content.startsWith('🖥️') || msg.content.includes('⁣')) stopTyping(msg.channelId)
+    if (recentSentIds.has(msg.id) || msg.content.includes('⁣')) stopTyping(msg.channelId)
     return
   }
   if (msg.author.bot) return
@@ -1952,6 +1997,7 @@ client.once('ready', c => {
         writeLiveRegistry()
         replayEarlyDrops()
         await deliverSpool()
+        await pollCommandFile()
       }
     } catch (err) {
       process.stderr.write(`discord channel: channel binding failed: ${err}\n`)
@@ -1961,6 +2007,12 @@ client.once('ready', c => {
     ;(t as any).unref?.()
   }
   void rebind()
+  // Watcher-injected commands should land fast — poll on a short interval
+  // (the rebind cadence is 30s once settled).
+  const cmdTimer = setInterval(() => {
+    void pollCommandFile().catch(() => {})
+  }, 3_000)
+  ;(cmdTimer as any).unref?.()
 })
 
 client.login(TOKEN).catch(err => {
