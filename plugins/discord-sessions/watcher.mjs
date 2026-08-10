@@ -733,13 +733,17 @@ async function skillsCmd(msg, filter) {
     )
   }
   try {
+    // Discord 500s when several menus WITH option descriptions share one
+    // message (verified by bisecting) — one message per menu works.
     await msg.reply({
       content:
         `Pick a skill (${total} available${total > 125 ? ', showing 125 — narrow with `!skills <filter>`' : ''}) — it runs in this channel's session (waking it if needed):`,
-      components: rows,
+      components: [rows[0]],
     })
+    for (const row of rows.slice(1)) {
+      await msg.channel.send({ components: [row] })
+    }
   } catch (err) {
-    // Menus occasionally 500 on Discord's side — degrade to a plain list.
     log(`skills menu failed, falling back to text: ${err}`)
     const text = shown.map(s => `\`/${s.name}\``).join(' · ')
     await msg.reply(`Menus unavailable right now — ask the session directly ("run /name"). Available:\n${text.slice(0, 1900)}`)
