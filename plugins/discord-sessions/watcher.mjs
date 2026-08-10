@@ -510,7 +510,8 @@ const HELP_TEXT = [
   '`!logs` — recent watcher log lines',
   '`!skills` — pick a skill from a list and run it in this channel',
   '`!help` — this message',
-  "Skills and slash-command work (like /daily) — just ask the session in its channel, it runs them itself.",
+  '`/skill` — searchable skill picker (type to filter), or `!skills [filter]` for dropdowns',
+  'You can also just ask the session ("run /daily") — it runs skills itself.',
 ].join('\n')
 
 const STARTED_AT = Date.now()
@@ -634,7 +635,28 @@ async function updateCmd(msg) {
 // skills (~/.claude/skills), user commands (~/.claude/commands), and the
 // skills + commands of every ENABLED plugin in the cache.
 function frontmatterDesc(md) {
-  return md.match(/^description:\s*(.+)$/m)?.[1]?.trim() ?? ''
+  const m = md.match(/^description:[ \t]*(.*)$/m)
+  if (!m) return ''
+  let v = m[1].trim()
+  // YAML folded/literal blocks (">", ">-", "|", "|-") or an empty value:
+  // the text lives on the following indented lines.
+  if (v === '' || /^[>|][+-]?$/.test(v)) {
+    const after = md.slice(m.index + m[0].length)
+    const lines = []
+    for (const line of after.split('\n').slice(1)) {
+      if (/^[ \t]+\S/.test(line)) lines.push(line.trim())
+      else if (line.trim() === '') continue
+      else break
+    }
+    v = lines.join(' ')
+  }
+  // strip surrounding quotes
+  v = v.replace(/^(['"])(.*)\1$/s, '$2').trim()
+  return v
+}
+
+function clip(s, n) {
+  return s.length > n ? s.slice(0, n - 1) + '…' : s
 }
 
 function listSkills() {
@@ -724,9 +746,9 @@ async function skillsCmd(msg, filter) {
           .setPlaceholder(`Choose a skill to run (${chunk[0].name.slice(0, 20)} … ${chunk[chunk.length - 1].name.slice(0, 20)})`)
           .addOptions(
             chunk.map(s => ({
-              label: `/${s.name}`.slice(0, 100),
+              label: clip(`/${s.name}`, 100),
               value: s.name.slice(0, 100),
-              ...(s.desc ? { description: s.desc.slice(0, 100) } : {}),
+              ...(s.desc ? { description: clip(s.desc, 100) } : {}),
             })),
           ),
       ),
@@ -981,36 +1003,53 @@ client.on('messageCreate', async msg => {
 
 client.on('error', err => log(`client error: ${err}`))
 
+// Queue a skill for a channel's session (waking one if needed). Returns the
+// message to show the user.
+async function queueSkill(interaction, skill) {
+  const ch = interaction.channel
+  const isThread = typeof ch?.isThread === 'function' && ch.isThread()
+  const channelId = isThread ? (ch.parentId ?? interaction.channelId) : interaction.channelId
+  const channelName = isThread ? ch.parent?.name : ch?.name
+  if (!channelName) return 'Could not resolve this channel.'
+  writeCommandFile(channelId, `Run the /${skill} skill now.`, interaction.user)
+  if (!channelOwned(channelId, channelName)) {
+    const r = await spawnForChannel(channelId, channelName)
+    if (!r.ok) return `⚠️ Can't run /${skill}: folder \`${r.cwd}\` was never trusted from a terminal.`
+    log(`#${channelName}: skill /${skill} queued (session waking)`)
+    return `▶️ /${skill} sent to #${channelName} (waking the session first, give it a moment).`
+  }
+  log(`#${channelName}: skill /${skill} queued`)
+  return `▶️ /${skill} sent to #${channelName}.`
+}
+
 client.on('interactionCreate', async i => {
   try {
+    // /skill autocomplete: live search over everything the terminal / has.
+    if (i.isAutocomplete() && i.commandName === 'skill') {
+      const q = (i.options.getFocused() ?? '').toLowerCase()
+      const hits = listSkills()
+        .filter(s => !q || s.name.toLowerCase().includes(q) || s.desc.toLowerCase().includes(q))
+        .slice(0, 25)
+        .map(s => ({ name: clip(`/${s.name}${s.desc ? ' — ' + s.desc : ''}`, 100), value: s.name.slice(0, 100) }))
+      await i.respond(hits)
+      return
+    }
+    if (i.isChatInputCommand() && i.commandName === 'skill') {
+      if (!allowFrom.includes(i.user.id)) {
+        await i.reply({ content: 'Not allowed.', ephemeral: true })
+        return
+      }
+      const skill = i.options.getString('name', true)
+      await i.reply(await queueSkill(i, skill))
+      return
+    }
     if (!i.isStringSelectMenu() || !i.customId.startsWith('runskill')) return
     if (!allowFrom.includes(i.user.id)) {
       await i.reply({ content: 'Not allowed.', ephemeral: true })
       return
     }
-    const skill = i.values[0]
-    const isThread = typeof i.channel?.isThread === 'function' && i.channel.isThread()
-    const channelId = isThread ? (i.channel.parentId ?? i.channelId) : i.channelId
-    const channelName = isThread ? i.channel.parent?.name : i.channel?.name
-    if (!channelName) {
-      await i.reply({ content: 'Could not resolve this channel.', ephemeral: true })
-      return
-    }
-    writeCommandFile(channelId, `Run the /${skill} skill now.`, i.user)
-    let note = ''
-    if (!channelOwned(channelId, channelName)) {
-      const r = await spawnForChannel(channelId, channelName)
-      if (!r.ok) {
-        await i.update({
-          content: `⚠️ Can't run /${skill}: folder \`${r.cwd}\` was never trusted from a terminal.`,
-          components: [],
-        })
-        return
-      }
-      note = ' (waking the session first, give it a moment)'
-    }
-    await i.update({ content: `▶️ /${skill} sent to #${channelName}${note}.`, components: [] })
-    log(`#${channelName}: skill /${skill} queued`)
+    const result = await queueSkill(i, i.values[0])
+    await i.update({ content: result, components: [] })
   } catch (err) {
     log(`interaction error: ${err}`)
   }
@@ -1030,6 +1069,31 @@ client.on('guildCreate', async guild => {
 
 client.once('ready', c => {
   log(`watcher connected as ${c.user.tag} (pid ${process.pid}, idle ${config.idleMinutes}min, default ${config.defaultDir})`)
+  // /skill slash command with autocomplete — the searchable picker. Guild-
+  // scoped registration is instant (global takes up to an hour).
+  if (routing.guildId) {
+    void c.application.commands
+      .set(
+        [
+          {
+            name: 'skill',
+            description: "Run a Claude skill in this channel's session",
+            options: [
+              {
+                type: 3, // STRING
+                name: 'name',
+                description: 'Skill to run (type to search)',
+                required: true,
+                autocomplete: true,
+              },
+            ],
+          },
+        ],
+        routing.guildId,
+      )
+      .then(() => log('registered /skill slash command'))
+      .catch(err => log(`slash command registration failed: ${err}`))
+  }
 })
 
 client.login(TOKEN).catch(err => {
