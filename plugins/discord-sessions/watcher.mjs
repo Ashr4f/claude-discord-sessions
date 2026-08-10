@@ -562,6 +562,7 @@ const HELP_TEXT = [
   '`/kill` — stop one background session (autocompletes)',
   '`/killall` — stop all background sessions',
   '`/restart` — restart background session(s) (`all` or one channel)',
+  '`/open` / `/hide` — show a background session\'s live terminal on the PC screen / tuck it away',
   '`/update` — update Claude Code itself',
   '`/status` — watcher uptime, Claude version, idle timers',
   '`/logs` — recent watcher log lines',
@@ -876,6 +877,38 @@ function sessionsText() {
   return rows.length > 0 ? '**Live sessions:**\n' + rows.join('\n') : 'No live sessions.'
 }
 
+// Show/hide the hidden console window of a background session (Windows).
+function consoleWindow(claudePid, action) {
+  return new Promise(resolve => {
+    const p = spawn(
+      'powershell.exe',
+      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', join(STATE_DIR, 'show-console.ps1'), '-ClaudePid', String(claudePid), '-Action', action],
+      { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true },
+    )
+    let out = ''
+    p.stdout.on('data', d => (out += d))
+    p.on('close', code => resolve({ ok: code === 0, out: out.trim() }))
+    p.on('error', () => resolve({ ok: false, out: 'spawn failed' }))
+    setTimeout(() => {
+      try {
+        p.kill()
+      } catch {}
+      resolve({ ok: false, out: 'timed out' })
+    }, 20_000).unref?.()
+  })
+}
+
+async function openText(name, action) {
+  if (!IS_WIN) return 'Only available on Windows for now.'
+  const hit = findSpawnedByName(name)
+  if (!hit) return `No background session on \`#${name.replace(/^#/, '')}\`.`
+  const r = await consoleWindow(hit[1].pid, action)
+  if (!r.ok) return `⚠️ Could not ${action} the window (${r.out}).`
+  return action === 'show'
+    ? `🖥️ Terminal of #${hit[1].channelName} is now visible on the PC (closing that window kills the session — use /hide to tuck it away instead).`
+    : `Hidden again. #${hit[1].channelName} keeps running in the background.`
+}
+
 // ── plan usage: same data as the TUI /usage, via Claude Code's own OAuth ───
 // token (read-only; token refresh stays Claude Code's job — on 401 we just
 // say so instead of touching the refresh flow).
@@ -1150,7 +1183,7 @@ client.on('interactionCreate', async i => {
           .slice(0, 25)
           .map(s => ({ name: clip(`/${s.name}${s.desc ? ' — ' + s.desc : ''}`, 100), value: s.name.slice(0, 100) }))
         await i.respond(hits)
-      } else if (i.commandName === 'kill' || i.commandName === 'restart') {
+      } else if (i.commandName === 'kill' || i.commandName === 'restart' || i.commandName === 'open' || i.commandName === 'hide') {
         const names = Object.values(state.spawned)
           .filter(s => pidAlive(s.pid))
           .map(s => s.channelName)
@@ -1220,6 +1253,16 @@ client.on('interactionCreate', async i => {
           await i.editReply(await restartText(i.options.getString('target', true).toLowerCase()))
           return
         }
+        case 'open': {
+          await i.deferReply()
+          await i.editReply(await openText(i.options.getString('channel', true), 'show'))
+          return
+        }
+        case 'hide': {
+          await i.deferReply()
+          await i.editReply(await openText(i.options.getString('channel', true), 'hide'))
+          return
+        }
       }
       return
     }
@@ -1282,6 +1325,20 @@ client.once('ready', c => {
             description: 'Restart background session(s)',
             options: [
               { type: 3, name: 'target', description: 'A channel, or "all"', required: true, autocomplete: true },
+            ],
+          },
+          {
+            name: 'open',
+            description: "Show a background session's live terminal on the PC screen",
+            options: [
+              { type: 3, name: 'channel', description: 'Which background session', required: true, autocomplete: true },
+            ],
+          },
+          {
+            name: 'hide',
+            description: "Hide a background session's terminal window again",
+            options: [
+              { type: 3, name: 'channel', description: 'Which background session', required: true, autocomplete: true },
             ],
           },
         ],
