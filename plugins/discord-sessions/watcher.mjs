@@ -630,51 +630,112 @@ async function updateCmd(msg) {
   await msg.reply(`${summary || 'Done.'}\nCurrent version: ${ver}\nAlready-running sessions keep their version; background ones pick it up on their next wake (\`!restart all\` to force now).`)
 }
 
-// User skills (~/.claude/skills/*/SKILL.md) + user commands (~/.claude/commands/*.md).
+// Everything the terminal "/" list offers, minus per-project skills: user
+// skills (~/.claude/skills), user commands (~/.claude/commands), and the
+// skills + commands of every ENABLED plugin in the cache.
+function frontmatterDesc(md) {
+  return md.match(/^description:\s*(.+)$/m)?.[1]?.trim() ?? ''
+}
+
 function listSkills() {
   const out = []
+  const push = (name, desc) => {
+    if (!out.some(s => s.name === name)) out.push({ name, desc })
+  }
   try {
     for (const d of readdirSync(join(HOME, '.claude', 'skills'))) {
       try {
-        const md = readFileSync(join(HOME, '.claude', 'skills', d, 'SKILL.md'), 'utf8')
-        const desc = md.match(/^description:\s*(.+)$/m)?.[1] ?? ''
-        out.push({ name: d, desc })
+        push(d, frontmatterDesc(readFileSync(join(HOME, '.claude', 'skills', d, 'SKILL.md'), 'utf8')))
       } catch {}
     }
   } catch {}
   try {
     for (const f of readdirSync(join(HOME, '.claude', 'commands'))) {
       if (!f.endsWith('.md')) continue
-      const name = basename(f, '.md')
       let desc = ''
       try {
-        desc = readFileSync(join(HOME, '.claude', 'commands', f), 'utf8').match(/^description:\s*(.+)$/m)?.[1] ?? ''
+        desc = frontmatterDesc(readFileSync(join(HOME, '.claude', 'commands', f), 'utf8'))
       } catch {}
-      out.push({ name, desc })
+      push(basename(f, '.md'), desc)
     }
   } catch {}
-  return out.slice(0, 25)
+  // Plugin skills/commands, namespaced plugin:name like the terminal list.
+  const enabled = readJson(join(HOME, '.claude', 'settings.json'), {}).enabledPlugins ?? {}
+  const cacheRoot = join(HOME, '.claude', 'plugins', 'cache')
+  try {
+    for (const marketplace of readdirSync(cacheRoot)) {
+      let plugins = []
+      try {
+        plugins = readdirSync(join(cacheRoot, marketplace))
+      } catch {
+        continue
+      }
+      for (const plugin of plugins) {
+        if (enabled[`${plugin}@${marketplace}`] !== true) continue
+        let versions = []
+        try {
+          versions = readdirSync(join(cacheRoot, marketplace, plugin))
+        } catch {
+          continue
+        }
+        for (const ver of versions.slice(-1)) {
+          const base = join(cacheRoot, marketplace, plugin, ver)
+          try {
+            for (const d of readdirSync(join(base, 'skills'))) {
+              try {
+                push(`${plugin}:${d}`, frontmatterDesc(readFileSync(join(base, 'skills', d, 'SKILL.md'), 'utf8')))
+              } catch {}
+            }
+          } catch {}
+          try {
+            for (const f of readdirSync(join(base, 'commands'))) {
+              if (!f.endsWith('.md')) continue
+              let desc = ''
+              try {
+                desc = frontmatterDesc(readFileSync(join(base, 'commands', f), 'utf8'))
+              } catch {}
+              push(`${plugin}:${basename(f, '.md')}`, desc)
+            }
+          } catch {}
+        }
+      }
+    }
+  } catch {}
+  return out.sort((a, b) => a.name.localeCompare(b.name))
 }
 
-async function skillsCmd(msg) {
-  const skills = listSkills()
+async function skillsCmd(msg, filter) {
+  let skills = listSkills()
+  if (filter) skills = skills.filter(s => s.name.toLowerCase().includes(filter.toLowerCase()))
   if (skills.length === 0) {
-    await msg.reply('No user skills found (~/.claude/skills, ~/.claude/commands).')
+    await msg.reply(filter ? `No skills matching \`${filter}\`.` : 'No skills found.')
     return
   }
-  const menu = new StringSelectMenuBuilder()
-    .setCustomId('runskill')
-    .setPlaceholder('Choose a skill to run')
-    .addOptions(
-      skills.map(s => ({
-        label: `/${s.name}`.slice(0, 100),
-        value: s.name.slice(0, 100),
-        ...(s.desc ? { description: s.desc.slice(0, 100) } : {}),
-      })),
+  // Discord: 25 options per select menu, 5 menus per message = 125 max.
+  const total = skills.length
+  const shown = skills.slice(0, 125)
+  const rows = []
+  for (let i = 0; i < shown.length; i += 25) {
+    const chunk = shown.slice(i, i + 25)
+    rows.push(
+      new ActionRowBuilder().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId(`runskill:${i}`)
+          .setPlaceholder(`Choose a skill to run (${chunk[0].name.slice(0, 20)} … ${chunk[chunk.length - 1].name.slice(0, 20)})`)
+          .addOptions(
+            chunk.map(s => ({
+              label: `/${s.name}`.slice(0, 100),
+              value: s.name.slice(0, 100),
+              ...(s.desc ? { description: s.desc.slice(0, 100) } : {}),
+            })),
+          ),
+      ),
     )
+  }
   await msg.reply({
-    content: 'Pick a skill — it runs in this channel\'s session (waking it if needed):',
-    components: [new ActionRowBuilder().addComponents(menu)],
+    content:
+      `Pick a skill (${total} available${total > 125 ? ', showing 125 — narrow with `!skills <filter>`' : ''}) — it runs in this channel's session (waking it if needed):`,
+    components: rows,
   })
 }
 
@@ -857,7 +918,7 @@ client.on('messageCreate', async msg => {
           await logsCmd(msg)
           return
         case 'skills':
-          await skillsCmd(msg)
+          await skillsCmd(msg, (arg ?? '').trim())
           return
         case 'help':
           await msg.reply(HELP_TEXT)
@@ -908,7 +969,7 @@ client.on('error', err => log(`client error: ${err}`))
 
 client.on('interactionCreate', async i => {
   try {
-    if (!i.isStringSelectMenu() || i.customId !== 'runskill') return
+    if (!i.isStringSelectMenu() || !i.customId.startsWith('runskill')) return
     if (!allowFrom.includes(i.user.id)) {
       await i.reply({ content: 'Not allowed.', ephemeral: true })
       return
