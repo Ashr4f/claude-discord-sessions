@@ -500,17 +500,16 @@ async function wake(channelId, channelName, msg) {
 
 // ── control commands ────────────────────────────────────────────────────────
 const HELP_TEXT = [
-  '**Claude session watcher** — talk normally and a session wakes for this channel. Commands:',
-  '`!sessions` — list live sessions (terminal + background)',
-  '`!kill <channel>` — stop that background session',
-  '`!killall` — stop all background sessions',
-  '`!restart <channel>` / `!restart all` — restart background session(s)',
-  '`!update` — update Claude Code itself',
-  '`!status` — watcher uptime, Claude version, idle timers',
-  '`!logs` — recent watcher log lines',
-  '`!skills` — pick a skill from a list and run it in this channel',
-  '`!help` — this message',
-  '`/skill` — searchable skill picker (type to filter), or `!skills [filter]` for dropdowns',
+  '**Claude session watcher** — talk normally and a session wakes for this channel. Slash commands:',
+  '`/skill` — run a skill here (type to search the full list)',
+  '`/sessions` — list live sessions (terminal + background)',
+  '`/kill` — stop one background session (autocompletes)',
+  '`/killall` — stop all background sessions',
+  '`/restart` — restart background session(s) (`all` or one channel)',
+  '`/update` — update Claude Code itself',
+  '`/status` — watcher uptime, Claude version, idle timers',
+  '`/logs` — recent watcher log lines',
+  '`/help` — this message',
   'You can also just ask the session ("run /daily") — it runs skills itself.',
 ].join('\n')
 
@@ -536,17 +535,16 @@ function findSpawnedByName(name) {
   return Object.entries(state.spawned).find(([, s]) => s.channelName.toLowerCase() === clean) ?? null
 }
 
-async function killOne(msg, name) {
+async function killOneText(name) {
   const hit = findSpawnedByName(name)
   if (!hit) {
-    await msg.reply(`No background session on \`#${name.replace(/^#/, '')}\`. Terminal sessions can only be closed from their terminal. \`!sessions\` shows what runs where.`)
-    return
+    return `No background session on \`#${name.replace(/^#/, '')}\`. Terminal sessions can only be closed from their terminal. \`/sessions\` shows what runs where.`
   }
   const [cid, s] = hit
   if (pidAlive(s.pid)) await killTree(s.pid)
   delete state.spawned[cid]
   saveState()
-  await msg.reply(`🛑 Stopped the background session on #${s.channelName}.`)
+  return `🛑 Stopped the background session on #${s.channelName}.`
 }
 
 async function restartOne(cid, s) {
@@ -563,17 +561,11 @@ async function restartOne(cid, s) {
   saveState()
 }
 
-async function restartCmd(msg, target) {
-  if (!target) {
-    await msg.reply('Usage: `!restart <channel>` or `!restart all`')
-    return
-  }
+async function restartText(target) {
+  if (!target) return 'Usage: `/restart target:<channel|all>`'
   if (target === 'all') {
     const entries = Object.entries(state.spawned)
-    if (entries.length === 0) {
-      await msg.reply('No background sessions to restart.')
-      return
-    }
+    if (entries.length === 0) return 'No background sessions to restart.'
     const failed = []
     for (const [cid, s] of entries) {
       try {
@@ -583,21 +575,16 @@ async function restartCmd(msg, target) {
       }
     }
     const ok = entries.length - failed.length
-    await msg.reply(`🔄 Restarted ${ok} background session(s).${failed.length > 0 ? '\n⚠️ ' + failed.join('\n⚠️ ') : ''}`)
-    return
+    return `🔄 Restarted ${ok} background session(s).${failed.length > 0 ? '\n⚠️ ' + failed.join('\n⚠️ ') : ''}`
   }
   const hit = findSpawnedByName(target)
-  if (!hit) {
-    await msg.reply(`No background session on \`#${target.replace(/^#/, '')}\`. Terminal sessions restart from their terminal.`)
-    return
-  }
+  if (!hit) return `No background session on \`#${target.replace(/^#/, '')}\`. Terminal sessions restart from their terminal.`
   try {
     await restartOne(hit[0], hit[1])
   } catch (err) {
-    await msg.reply(`⚠️ Restart of #${hit[1].channelName} failed: ${err.message}`)
-    return
+    return `⚠️ Restart of #${hit[1].channelName} failed: ${err.message}`
   }
-  await msg.reply(`🔄 Restarted the background session on #${hit[1].channelName}. It resumes its conversation.`)
+  return `🔄 Restarted the background session on #${hit[1].channelName}. It resumes its conversation.`
 }
 
 function runClaude(args, timeoutMs) {
@@ -623,12 +610,11 @@ function runClaude(args, timeoutMs) {
   })
 }
 
-async function updateCmd(msg) {
-  await msg.reply('⬆️ Updating Claude Code…')
+async function updateText() {
   const out = (await runClaude(['update'], 180_000)).trim()
   const ver = (await runClaude(['--version'], 30_000)).trim()
   const summary = out.split('\n').slice(-3).join('\n')
-  await msg.reply(`${summary || 'Done.'}\nCurrent version: ${ver}\nAlready-running sessions keep their version; background ones pick it up on their next wake (\`!restart all\` to force now).`)
+  return `${summary || 'Done.'}\nCurrent version: ${ver}\nAlready-running sessions keep their version; background ones pick it up on their next wake (\`/restart target:all\` to force now).`
 }
 
 // Everything the terminal "/" list offers, minus per-project skills: user
@@ -796,7 +782,7 @@ async function spawnForChannel(channelId, channelName) {
   return { ok: true, cwd }
 }
 
-async function statusCmd(msg) {
+async function statusText() {
   if (!cachedVersion) cachedVersion = (await runClaude(['--version'], 30_000)).trim()
   const up = Math.round((Date.now() - STARTED_AT) / 60000)
   const idleMs = Math.max(1, config.idleMinutes) * 60 * 1000
@@ -813,16 +799,21 @@ async function statusCmd(msg) {
     })
   const terminals = listLive().filter(r => r.includes('(terminal)'))
   rows.push(...(spawnedRows.length > 0 ? spawnedRows : ['No background sessions.']), ...terminals)
-  await msg.reply(rows.join('\n'))
+  return rows.join('\n')
 }
 
-async function logsCmd(msg) {
+function logsText() {
   let tail = ''
   try {
     tail = readTail(LOG_FILE, 16 * 1024)
   } catch {}
   const lines = tail.split('\n').filter(Boolean).slice(-12).join('\n')
-  await msg.reply(lines ? '```\n' + lines.slice(-1800) + '\n```' : 'Log is empty.')
+  return lines ? '```\n' + lines.slice(-1800) + '\n```' : 'Log is empty.'
+}
+
+function sessionsText() {
+  const rows = listLive()
+  return rows.length > 0 ? '**Live sessions:**\n' + rows.join('\n') : 'No live sessions.'
 }
 
 // First contact with a fresh channel: post the command list and try to pin
@@ -926,32 +917,30 @@ client.on('messageCreate', async msg => {
       return
     }
 
+    // Legacy "!" commands: kept working as a fallback, /commands are the
+    // documented interface.
     async function runCommand(name, arg, msg) {
       switch (name) {
-        case 'killall': {
-          const n = await killAllSpawned()
-          await msg.reply(`🛑 Stopped ${n} background session(s). Watcher still alive.`)
+        case 'killall':
+          await msg.reply(`🛑 Stopped ${await killAllSpawned()} background session(s). Watcher still alive.`)
           return
-        }
         case 'kill':
-          await killOne(msg, (arg ?? '').trim() || '?')
+          await msg.reply(await killOneText((arg ?? '').trim() || '?'))
           return
         case 'restart':
-          await restartCmd(msg, (arg ?? '').trim().toLowerCase())
+          await msg.reply(await restartText((arg ?? '').trim().toLowerCase()))
           return
         case 'update':
-          await updateCmd(msg)
+          await msg.reply(await updateText())
           return
-        case 'sessions': {
-          const rows = listLive()
-          await msg.reply(rows.length > 0 ? '**Live sessions:**\n' + rows.join('\n') : 'No live sessions.')
+        case 'sessions':
+          await msg.reply(sessionsText())
           return
-        }
         case 'status':
-          await statusCmd(msg)
+          await msg.reply(await statusText())
           return
         case 'logs':
-          await logsCmd(msg)
+          await msg.reply(logsText())
           return
         case 'skills':
           await skillsCmd(msg, (arg ?? '').trim())
@@ -960,7 +949,7 @@ client.on('messageCreate', async msg => {
           await msg.reply(HELP_TEXT)
           return
         default:
-          await msg.reply(`Unknown command \`!${name}\` — \`!help\` lists them.`)
+          await msg.reply(`Unknown command \`!${name}\` — \`/help\` lists the commands.`)
           return
       }
     }
@@ -1024,25 +1013,79 @@ async function queueSkill(interaction, skill) {
 
 client.on('interactionCreate', async i => {
   try {
-    // /skill autocomplete: live search over everything the terminal / has.
-    if (i.isAutocomplete() && i.commandName === 'skill') {
+    if (i.isAutocomplete()) {
       const q = (i.options.getFocused() ?? '').toLowerCase()
-      const hits = listSkills()
-        .filter(s => !q || s.name.toLowerCase().includes(q) || s.desc.toLowerCase().includes(q))
-        .slice(0, 25)
-        .map(s => ({ name: clip(`/${s.name}${s.desc ? ' — ' + s.desc : ''}`, 100), value: s.name.slice(0, 100) }))
-      await i.respond(hits)
+      if (i.commandName === 'skill') {
+        // live search over everything the terminal / list has
+        const hits = listSkills()
+          .filter(s => !q || s.name.toLowerCase().includes(q) || s.desc.toLowerCase().includes(q))
+          .slice(0, 25)
+          .map(s => ({ name: clip(`/${s.name}${s.desc ? ' — ' + s.desc : ''}`, 100), value: s.name.slice(0, 100) }))
+        await i.respond(hits)
+      } else if (i.commandName === 'kill' || i.commandName === 'restart') {
+        const names = Object.values(state.spawned)
+          .filter(s => pidAlive(s.pid))
+          .map(s => s.channelName)
+        if (i.commandName === 'restart') names.unshift('all')
+        await i.respond(
+          names
+            .filter(n => !q || n.toLowerCase().includes(q))
+            .slice(0, 25)
+            .map(n => ({ name: n === 'all' ? 'all (every background session)' : `#${n}`, value: n })),
+        )
+      }
       return
     }
-    if (i.isChatInputCommand() && i.commandName === 'skill') {
+
+    if (i.isChatInputCommand()) {
       if (!allowFrom.includes(i.user.id)) {
         await i.reply({ content: 'Not allowed.', ephemeral: true })
         return
       }
-      const skill = i.options.getString('name', true)
-      await i.reply(await queueSkill(i, skill))
+      switch (i.commandName) {
+        case 'skill': {
+          await i.deferReply()
+          await i.editReply(await queueSkill(i, i.options.getString('name', true)))
+          return
+        }
+        case 'sessions':
+          await i.reply(sessionsText())
+          return
+        case 'status': {
+          await i.deferReply()
+          await i.editReply(await statusText())
+          return
+        }
+        case 'logs':
+          await i.reply(logsText())
+          return
+        case 'help':
+          await i.reply(HELP_TEXT)
+          return
+        case 'update': {
+          await i.deferReply()
+          await i.editReply(await updateText())
+          return
+        }
+        case 'killall': {
+          await i.deferReply()
+          await i.editReply(`🛑 Stopped ${await killAllSpawned()} background session(s). Watcher still alive.`)
+          return
+        }
+        case 'kill': {
+          await i.deferReply()
+          await i.editReply(await killOneText(i.options.getString('channel', true)))
+          return
+        }
+        case 'restart': {
+          await i.deferReply()
+          await i.editReply(await restartText(i.options.getString('target', true).toLowerCase()))
+          return
+        }
+      }
       return
     }
+
     if (!i.isStringSelectMenu() || !i.customId.startsWith('runskill')) return
     if (!allowFrom.includes(i.user.id)) {
       await i.reply({ content: 'Not allowed.', ephemeral: true })
@@ -1069,8 +1112,8 @@ client.on('guildCreate', async guild => {
 
 client.once('ready', c => {
   log(`watcher connected as ${c.user.tag} (pid ${process.pid}, idle ${config.idleMinutes}min, default ${config.defaultDir})`)
-  // /skill slash command with autocomplete — the searchable picker. Guild-
-  // scoped registration is instant (global takes up to an hour).
+  // Slash commands — guild-scoped registration is instant (global takes up
+  // to an hour). type 3 = STRING option.
   if (routing.guildId) {
     void c.application.commands
       .set(
@@ -1079,19 +1122,33 @@ client.once('ready', c => {
             name: 'skill',
             description: "Run a Claude skill in this channel's session",
             options: [
-              {
-                type: 3, // STRING
-                name: 'name',
-                description: 'Skill to run (type to search)',
-                required: true,
-                autocomplete: true,
-              },
+              { type: 3, name: 'name', description: 'Skill to run (type to search)', required: true, autocomplete: true },
+            ],
+          },
+          { name: 'sessions', description: 'List live Claude sessions (terminal + background)' },
+          { name: 'status', description: 'Watcher status: uptime, Claude version, idle timers' },
+          { name: 'logs', description: 'Recent watcher log lines' },
+          { name: 'help', description: 'How the watcher works, all commands' },
+          { name: 'update', description: 'Update Claude Code itself' },
+          { name: 'killall', description: 'Stop every background session (watcher stays alive)' },
+          {
+            name: 'kill',
+            description: 'Stop one background session',
+            options: [
+              { type: 3, name: 'channel', description: 'Which background session', required: true, autocomplete: true },
+            ],
+          },
+          {
+            name: 'restart',
+            description: 'Restart background session(s)',
+            options: [
+              { type: 3, name: 'target', description: 'A channel, or "all"', required: true, autocomplete: true },
             ],
           },
         ],
         routing.guildId,
       )
-      .then(() => log('registered /skill slash command'))
+      .then(() => log('registered slash commands'))
       .catch(err => log(`slash command registration failed: ${err}`))
   }
 })
