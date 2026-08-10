@@ -1,0 +1,530 @@
+#!/usr/bin/env bun
+/**
+ * Wake-on-message watcher for per-session Discord routing.
+ *
+ * Tiny always-on process (Task Scheduler, at logon) that holds a Discord
+ * gateway connection so the bot is online whenever the PC is on/locked.
+ * When a message lands in a channel that no live Claude session owns, it
+ * wakes one:
+ *   - a session with a matching name exists on disk  -> resume it in its folder
+ *   - new channel + first message contains a path    -> new session in that folder
+ *   - no path                                        -> new session in defaultDir
+ * The triggering message is spooled to pending/<channelId>.json; the woken
+ * session's MCP server delivers it after binding. Live sessions register in
+ * live/<pid>.json (written by the patched server.ts) — the watcher never
+ * spawns over a live one, so terminal sessions keep priority.
+ *
+ * Control commands (allowlisted user, any watched channel):
+ *   !killall   kill every background session the watcher spawned
+ *   !sessions  list live sessions (terminal + background)
+ *
+ * Idle background sessions are killed after idleMinutes (watcher.json).
+ */
+
+import { createRequire } from 'module'
+import {
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  readdirSync,
+  statSync,
+  rmSync,
+  existsSync,
+  openSync,
+  readSync,
+  closeSync,
+  appendFileSync,
+} from 'fs'
+import { homedir } from 'os'
+import { join, basename } from 'path'
+import { execFileSync } from 'child_process'
+
+const HOME = homedir()
+const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(HOME, '.claude', 'channels', 'discord')
+const LIVE_DIR = join(STATE_DIR, 'live')
+const SPOOL_DIR = join(STATE_DIR, 'pending')
+const PROJECTS_DIR = join(HOME, '.claude', 'projects')
+const CONFIG_FILE = join(STATE_DIR, 'watcher.json')
+const STATE_FILE = join(STATE_DIR, 'watcher-state.json')
+const LOG_FILE = join(STATE_DIR, 'watcher-log.txt')
+const LOCK_FILE = join(STATE_DIR, 'watcher.lock')
+
+function log(s) {
+  const line = `${new Date().toISOString()} ${s}\n`
+  try {
+    if (existsSync(LOG_FILE) && statSync(LOG_FILE).size > 2 * 1024 * 1024) rmSync(LOG_FILE)
+  } catch {}
+  try {
+    appendFileSync(LOG_FILE, line)
+  } catch {}
+  process.stderr.write(line)
+}
+
+function readJson(f, fallback) {
+  try {
+    return JSON.parse(readFileSync(f, 'utf8'))
+  } catch {
+    return fallback
+  }
+}
+
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+// ── single instance ─────────────────────────────────────────────────────────
+{
+  const lock = readJson(LOCK_FILE, null)
+  if (lock && lock.pid !== process.pid && pidAlive(lock.pid)) {
+    process.stderr.write(`watcher already running (pid ${lock.pid}), exiting\n`)
+    process.exit(0)
+  }
+  writeFileSync(LOCK_FILE, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }))
+}
+
+// ── config / access / routing ───────────────────────────────────────────────
+const config = { idleMinutes: 30, defaultDir: HOME, ...readJson(CONFIG_FILE, {}) }
+const routing = readJson(join(STATE_DIR, 'channels.json'), {})
+const access = readJson(join(STATE_DIR, 'access.json'), {})
+const allowFrom = access.allowFrom ?? []
+
+let TOKEN = process.env.DISCORD_BOT_TOKEN
+if (!TOKEN) {
+  const env = readFileSync(join(STATE_DIR, '.env'), 'utf8')
+  TOKEN = env.match(/^DISCORD_BOT_TOKEN=(.+)$/m)?.[1]?.trim()
+}
+if (!TOKEN) {
+  log('no DISCORD_BOT_TOKEN, exiting')
+  process.exit(1)
+}
+
+// ── discord.js from the official plugin's node_modules ─────────────────────
+function pluginDir() {
+  const base = join(HOME, '.claude', 'plugins', 'cache', 'claude-plugins-official', 'discord')
+  const versions = readdirSync(base).filter(v => existsSync(join(base, v, 'node_modules', 'discord.js')))
+  if (versions.length === 0) throw new Error('official discord plugin cache not found')
+  versions.sort((a, b) => statSync(join(base, b)).mtimeMs - statSync(join(base, a)).mtimeMs)
+  return join(base, versions[0])
+}
+const requirePlugin = createRequire(join(pluginDir(), 'noop.js'))
+const { Client, GatewayIntentBits, Partials } = requirePlugin('discord.js')
+
+// ── claude executable ───────────────────────────────────────────────────────
+function findClaude() {
+  try {
+    const out = execFileSync('where.exe', ['claude'], { encoding: 'utf8' })
+    const line = out.split(/\r?\n/).find(l => l.trim())
+    if (line) return line.trim()
+  } catch {}
+  throw new Error('claude executable not found on PATH')
+}
+const CLAUDE_EXE = findClaude()
+
+// ── helpers shared with server.ts (keep in sync) ────────────────────────────
+function slugify(s) {
+  return s
+    .toLowerCase()
+    .trim()
+    .replace(/[\s\/\\#@:*?"<>|]+/g, '-')
+    .replace(/-{2,}/g, '-')
+    .replace(/^-+|-+$/g, '')
+}
+
+function readTail(file, bytes) {
+  const fd = openSync(file, 'r')
+  try {
+    const size = statSync(file).size
+    const len = Math.min(bytes, size)
+    const buf = Buffer.alloc(len)
+    readSync(fd, buf, 0, len, size - len)
+    return buf.toString('utf8')
+  } finally {
+    closeSync(fd)
+  }
+}
+
+function readHead(file, bytes) {
+  const fd = openSync(file, 'r')
+  try {
+    const size = statSync(file).size
+    const len = Math.min(bytes, size)
+    const buf = Buffer.alloc(len)
+    readSync(fd, buf, 0, len, 0)
+    return buf.toString('utf8')
+  } finally {
+    closeSync(fd)
+  }
+}
+
+// ── persisted state: spawned sessions + transcript index cache ─────────────
+const state = { spawned: {}, index: {}, ...readJson(STATE_FILE, {}) }
+let saveTimer = null
+function saveState() {
+  if (saveTimer) return
+  saveTimer = setTimeout(() => {
+    saveTimer = null
+    try {
+      writeFileSync(STATE_FILE, JSON.stringify(state))
+    } catch {}
+  }, 500)
+}
+
+// Adopt-or-drop spawned entries from a previous watcher run.
+for (const [cid, s] of Object.entries(state.spawned)) {
+  if (!pidAlive(s.pid)) delete state.spawned[cid]
+}
+saveState()
+
+// ── session index: every transcript on the PC -> {title, cwd, sessionId} ───
+function indexSessions() {
+  const seen = new Set()
+  let dirs = []
+  try {
+    dirs = readdirSync(PROJECTS_DIR)
+  } catch {
+    return []
+  }
+  for (const d of dirs) {
+    const dir = join(PROJECTS_DIR, d)
+    let files = []
+    try {
+      files = readdirSync(dir).filter(f => f.endsWith('.jsonl'))
+    } catch {
+      continue
+    }
+    for (const f of files) {
+      const p = join(dir, f)
+      seen.add(p)
+      let st
+      try {
+        st = statSync(p)
+      } catch {
+        continue
+      }
+      const cached = state.index[p]
+      if (cached && cached.mtimeMs === st.mtimeMs) continue
+      let title = null
+      let cwd = null
+      try {
+        const tail = readTail(p, 4 * 1024 * 1024)
+        const titles = [...tail.matchAll(/"type":"custom-title","customTitle":"((?:[^"\\]|\\.)*)"/g)]
+        if (titles.length > 0) title = JSON.parse(`"${titles[titles.length - 1][1]}"`)
+        const head = readHead(p, 64 * 1024)
+        const cm = head.match(/"cwd":"((?:[^"\\]|\\.)*)"/)
+        if (cm) cwd = JSON.parse(`"${cm[1]}"`)
+      } catch {}
+      state.index[p] = { mtimeMs: st.mtimeMs, title, cwd, sessionId: basename(f, '.jsonl') }
+    }
+  }
+  for (const p of Object.keys(state.index)) if (!seen.has(p)) delete state.index[p]
+  saveState()
+  return Object.values(state.index)
+}
+
+function findSessionByName(channelName) {
+  const hits = Object.entries(state.index)
+    .filter(([, e]) => e.title && slugify(e.title) === channelName && e.cwd && existsSync(e.cwd))
+    .sort(([, a], [, b]) => b.mtimeMs - a.mtimeMs)
+  return hits.length > 0 ? hits[0][1] : null
+}
+
+// ── ownership: is some live session already bound to this channel? ─────────
+function channelOwned(channelId, channelName) {
+  let owned = false
+  let files = []
+  try {
+    files = readdirSync(LIVE_DIR).filter(f => f.endsWith('.json'))
+  } catch {}
+  for (const f of files) {
+    const p = join(LIVE_DIR, f)
+    const entry = readJson(p, null)
+    if (!entry) continue
+    if (!pidAlive(entry.pid)) {
+      try {
+        rmSync(p)
+      } catch {}
+      continue
+    }
+    if (entry.channelId === channelId) owned = true
+  }
+  if (owned) return true
+  // Fallback for sessions started before the live-registry patch: their
+  // server only appended to bind-log.txt. Latest bind per pid, pid alive.
+  if (channelName) {
+    try {
+      const tail = readTail(join(STATE_DIR, 'bind-log.txt'), 64 * 1024)
+      const byPid = new Map()
+      for (const m of tail.matchAll(/pid=(\d+) discord channel: session \S+ bound to #(\S+)/g)) {
+        byPid.set(Number(m[1]), m[2])
+      }
+      for (const [pid, name] of byPid) {
+        if (name === channelName && pidAlive(pid)) return true
+      }
+    } catch {}
+  }
+  return false
+}
+
+// ── spool: messages the woken session must answer once bound ───────────────
+function spoolMessage(channelId, msg) {
+  try {
+    mkdirSync(SPOOL_DIR, { recursive: true })
+    const f = join(SPOOL_DIR, `${channelId}.json`)
+    const cur = readJson(f, { messages: [] })
+    if (!cur.messages.some(m => m.messageId === msg.id)) {
+      cur.messages.push({ chatId: msg.channelId, messageId: msg.id })
+    }
+    writeFileSync(f, JSON.stringify(cur))
+  } catch (err) {
+    log(`spool failed for ${channelId}: ${err}`)
+  }
+}
+
+// Stale spools from before a reboot must not wake sessions for old messages.
+try {
+  for (const f of readdirSync(SPOOL_DIR)) {
+    const p = join(SPOOL_DIR, f)
+    if (Date.now() - statSync(p).mtimeMs > 30 * 60 * 1000) rmSync(p)
+  }
+} catch {}
+
+// ── spawn / kill ────────────────────────────────────────────────────────────
+function psQuote(s) {
+  return `'${String(s).replace(/'/g, "''")}'`
+}
+
+// A hidden session can't answer the first-run trust dialog, so we only spawn
+// in folders the user has already trusted from a real terminal (read-only
+// check of ~/.claude.json — the watcher never modifies trust itself).
+function isTrusted(dir) {
+  try {
+    const j = JSON.parse(readFileSync(join(HOME, '.claude.json'), 'utf8'))
+    const key = dir.replace(/\\/g, '/')
+    const alt = dir.replace(/\//g, '\\')
+    const p = j.projects ?? {}
+    return !!(p[key]?.hasTrustDialogAccepted || p[alt]?.hasTrustDialogAccepted || p[dir]?.hasTrustDialogAccepted)
+  } catch {
+    return false
+  }
+}
+
+function spawnClaude(cwd, channelName, resumeId) {
+  const argList = resumeId ? `-ArgumentList @('--resume', ${psQuote(resumeId)})` : ''
+  const script =
+    `$env:DISCORD_CHANNEL=${psQuote(channelName)}; ` +
+    `$p = Start-Process -FilePath ${psQuote(CLAUDE_EXE)} ${argList} ` +
+    `-WorkingDirectory ${psQuote(cwd)} -WindowStyle Hidden -PassThru; $p.Id`
+  const out = execFileSync('powershell.exe', ['-NoProfile', '-Command', script], {
+    encoding: 'utf8',
+    timeout: 30_000,
+  })
+  const pid = parseInt(out.trim(), 10)
+  if (!Number.isFinite(pid)) throw new Error(`spawn returned no pid: ${out}`)
+  return pid
+}
+
+function killTree(pid) {
+  try {
+    execFileSync('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { encoding: 'utf8', timeout: 15_000 })
+  } catch (err) {
+    log(`taskkill ${pid} failed: ${err}`)
+  }
+}
+
+// ── path extraction from a first message ────────────────────────────────────
+function extractPath(text) {
+  const m = (text ?? '').match(/(?:[A-Za-z]:[\\/]|~[\\/])[^\s"'<>|*?()]+/)
+  if (!m) return null
+  let p = m[0].replace(/[.,;:!?]+$/, '')
+  if (p.startsWith('~')) p = join(HOME, p.slice(1))
+  try {
+    if (existsSync(p) && statSync(p).isDirectory()) return p
+  } catch {}
+  return null
+}
+
+// ── wake ────────────────────────────────────────────────────────────────────
+const waking = new Set()
+
+async function wake(channelId, channelName, msg) {
+  spoolMessage(channelId, msg)
+  try {
+    await msg.react('⏳')
+  } catch {}
+
+  // A terminal session might be binding right now — give the registry a beat.
+  await new Promise(r => setTimeout(r, 2500))
+  if (channelOwned(channelId, channelName)) {
+    log(`#${channelName}: session appeared while waking, standing down (spool stays for it)`)
+    return
+  }
+
+  indexSessions()
+  const sess = findSessionByName(channelName)
+  let cwd, resumeId
+  if (sess) {
+    cwd = sess.cwd
+    resumeId = sess.sessionId
+    log(`#${channelName}: resuming session ${resumeId} in ${cwd}`)
+  } else {
+    cwd = extractPath(msg.content) ?? config.defaultDir ?? HOME
+    resumeId = null
+    log(`#${channelName}: no known session, spawning fresh in ${cwd}`)
+  }
+
+  if (!isTrusted(cwd)) {
+    log(`#${channelName}: ${cwd} not trusted, cannot wake a hidden session there`)
+    try {
+      await msg.reply(
+        `⚠️ Can't wake a background session in \`${cwd}\`: that folder was never opened in Claude Code, so its one-time trust prompt is unanswered. Open a terminal there once (\`claude\`), accept the prompt, then message me again.`,
+      )
+    } catch {}
+    return
+  }
+
+  const pid = spawnClaude(cwd, channelName, resumeId)
+  state.spawned[channelId] = {
+    pid,
+    channelName,
+    cwd,
+    spawnedAt: Date.now(),
+    lastActivity: Date.now(),
+  }
+  saveState()
+  log(`#${channelName}: spawned claude pid ${pid}`)
+}
+
+// ── control commands ────────────────────────────────────────────────────────
+function killAllSpawned() {
+  const entries = Object.entries(state.spawned)
+  for (const [cid, s] of entries) {
+    if (pidAlive(s.pid)) killTree(s.pid)
+    delete state.spawned[cid]
+  }
+  try {
+    for (const f of readdirSync(SPOOL_DIR)) rmSync(join(SPOOL_DIR, f))
+  } catch {}
+  waking.clear()
+  saveState()
+  return entries.length
+}
+
+function listLive() {
+  const rows = []
+  let files = []
+  try {
+    files = readdirSync(LIVE_DIR).filter(f => f.endsWith('.json'))
+  } catch {}
+  const spawnedPids = new Set(Object.values(state.spawned).map(s => s.pid))
+  for (const f of files) {
+    const e = readJson(join(LIVE_DIR, f), null)
+    if (!e || !pidAlive(e.pid)) continue
+    // A background session's live entry is written by its MCP server (child
+    // of the claude pid we spawned) — mark by channel instead of pid.
+    const bg = Object.values(state.spawned).some(s => s.channelName === e.channelName && pidAlive(s.pid))
+    rows.push(`#${e.channelName} — ${e.cwd} (${bg ? 'background' : 'terminal'})`)
+  }
+  for (const s of Object.values(state.spawned)) {
+    if (pidAlive(s.pid) && !rows.some(r => r.startsWith(`#${s.channelName} `))) {
+      rows.push(`#${s.channelName} — ${s.cwd} (background, starting…)`)
+    }
+  }
+  return rows
+}
+
+// ── idle reaper ─────────────────────────────────────────────────────────────
+setInterval(() => {
+  const idleMs = Math.max(1, config.idleMinutes) * 60 * 1000
+  for (const [cid, s] of Object.entries(state.spawned)) {
+    if (!pidAlive(s.pid)) {
+      delete state.spawned[cid]
+      saveState()
+      continue
+    }
+    if (Date.now() - s.lastActivity > idleMs) {
+      log(`#${s.channelName}: idle ${config.idleMinutes}min, shutting down pid ${s.pid}`)
+      killTree(s.pid)
+      delete state.spawned[cid]
+      saveState()
+    }
+  }
+}, 60_000)
+
+// ── gateway ─────────────────────────────────────────────────────────────────
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+  partials: [Partials.Channel],
+})
+
+client.on('messageCreate', async msg => {
+  try {
+    if (!msg.guildId) return
+    if (routing.guildId && msg.guildId !== routing.guildId) return
+    if (msg.system) return
+
+    const isThread = typeof msg.channel.isThread === 'function' && msg.channel.isThread()
+    const channelId = isThread ? (msg.channel.parentId ?? msg.channelId) : msg.channelId
+
+    // Any traffic (bot replies included) counts as activity for idle tracking.
+    const sp = state.spawned[channelId]
+    if (sp) {
+      sp.lastActivity = Date.now()
+      saveState()
+    }
+
+    if (msg.author?.bot) return
+    if (!allowFrom.includes(msg.author.id)) return
+
+    const content = (msg.content ?? '').trim()
+    if (content === '!killall') {
+      const n = killAllSpawned()
+      await msg.reply(`🛑 Stopped ${n} background session(s). Watcher still alive.`)
+      return
+    }
+    if (content === '!sessions') {
+      const rows = listLive()
+      await msg.reply(rows.length > 0 ? '**Live sessions:**\n' + rows.join('\n') : 'No live sessions.')
+      return
+    }
+
+    if (waking.has(channelId)) {
+      spoolMessage(channelId, msg)
+      return
+    }
+
+    let channelName
+    if (isThread) {
+      const parent = msg.channel.parent ?? (await client.channels.fetch(channelId).catch(() => null))
+      channelName = parent?.name
+    } else {
+      channelName = msg.channel.name
+    }
+    if (!channelName) return
+    if (channelOwned(channelId, channelName)) return
+
+    waking.add(channelId)
+    try {
+      await wake(channelId, channelName, msg)
+    } finally {
+      setTimeout(() => waking.delete(channelId), 90_000)
+    }
+  } catch (err) {
+    log(`messageCreate handler error: ${err}`)
+  }
+})
+
+client.on('error', err => log(`client error: ${err}`))
+
+client.once('ready', c => {
+  log(`watcher connected as ${c.user.tag} (pid ${process.pid}, idle ${config.idleMinutes}min, default ${config.defaultDir})`)
+})
+
+client.login(TOKEN).catch(err => {
+  log(`login failed: ${err}`)
+  process.exit(1)
+})

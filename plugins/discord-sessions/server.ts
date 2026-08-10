@@ -327,6 +327,68 @@ async function bindSessionChannel(): Promise<void> {
     if (hit) break
   }
 }
+
+// ── LOCAL PATCH: live-session registry + wake spool ────────────────────────
+// live/<pid>.json tells the wake-on-message watcher which channels already
+// have a running session (so it never spawns a duplicate). pending/<channelId>.json
+// is written by the watcher: the message(s) that triggered a wake, delivered
+// here once this session binds — they arrived before this process existed.
+const LIVE_DIR = join(STATE_DIR, 'live')
+const LIVE_FILE = join(LIVE_DIR, `${process.pid}.json`)
+const SPOOL_DIR = join(STATE_DIR, 'pending')
+let lastRegisteredChannelId: string | null = null
+
+function writeLiveRegistry(): void {
+  if (!boundChannelId || boundChannelId === lastRegisteredChannelId) return
+  try {
+    mkdirSync(LIVE_DIR, { recursive: true })
+    writeFileSync(
+      LIVE_FILE,
+      JSON.stringify({
+        pid: process.pid,
+        channelId: boundChannelId,
+        channelName: boundChannelName,
+        sessionId: sessionInfo?.sessionId ?? null,
+        cwd: SESSION_DIR,
+        boundAt: new Date().toISOString(),
+      }),
+    )
+    lastRegisteredChannelId = boundChannelId
+  } catch {}
+}
+
+async function deliverSpool(): Promise<void> {
+  if (!boundChannelId) return
+  const f = join(SPOOL_DIR, `${boundChannelId}.json`)
+  let raw: string
+  try {
+    raw = readFileSync(f, 'utf8')
+  } catch {
+    return
+  }
+  // Delete before delivering — a crash mid-delivery must not double-answer.
+  try {
+    rmSync(f)
+  } catch {}
+  let spool: { messages?: { chatId: string; messageId: string }[] } = {}
+  try {
+    spool = JSON.parse(raw)
+  } catch {
+    return
+  }
+  for (const m of spool.messages ?? []) {
+    try {
+      const ch = await client.channels.fetch(m.chatId)
+      if (!ch || !ch.isTextBased() || !('messages' in ch)) continue
+      const msg = await ch.messages.fetch(m.messageId)
+      if (!msg || msg.author?.bot) continue
+      process.stderr.write(`discord channel: delivering spooled wake message ${m.messageId}\n`)
+      await handleInbound(msg as Message)
+    } catch (err) {
+      process.stderr.write(`discord channel: spool delivery failed for ${m.messageId}: ${err}\n`)
+    }
+  }
+}
 // ── END LOCAL PATCH ──────────────────────────────────────────────────────
 
 type PendingEntry = {
@@ -1472,6 +1534,11 @@ function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
   process.stderr.write('discord channel: shutting down\n')
+  // LOCAL PATCH: drop the live-registry entry so the watcher knows this
+  // channel is free again.
+  try {
+    rmSync(LIVE_FILE)
+  } catch {}
   setTimeout(() => process.exit(0), 2000)
   void Promise.resolve(client.destroy()).finally(() => process.exit(0))
 }
@@ -1711,6 +1778,8 @@ function bufferEarlyDrop(msg: Message): void {
   if (earlyDropped.length > 25) earlyDropped.shift()
 }
 
+const deliveredIds = new Set<string>()
+
 function replayEarlyDrops(): void {
   if (!boundChannelId || earlyDropped.length === 0) return
   const mine = earlyDropped.filter(m => {
@@ -1766,6 +1835,12 @@ async function handleInbound(msg: Message): Promise<void> {
     return
   }
 
+  // LOCAL PATCH: dedupe across delivery paths (live gateway, early-drop
+  // replay, wake spool) — a message reaches the session at most once.
+  if (deliveredIds.has(msg.id)) return
+  deliveredIds.add(msg.id)
+  if (deliveredIds.size > 1000) deliveredIds.clear()
+
   // LOCAL PATCH: typing indicator kept alive while the session works.
   startTyping(msg.channel, msg.channelId)
   lastChatId = msg.channelId
@@ -1817,6 +1892,11 @@ client.once('ready', c => {
   const rebind = async () => {
     try {
       await bindSessionChannel()
+      if (boundChannelId) {
+        writeLiveRegistry()
+        replayEarlyDrops()
+        await deliverSpool()
+      }
     } catch (err) {
       process.stderr.write(`discord channel: channel binding failed: ${err}\n`)
     }
