@@ -663,6 +663,117 @@ function displayWidth(s: string): number {
   return w
 }
 
+// LOCAL PATCH: table cells wrap instead of being forced onto one line.
+// Upstream printed each cell on a single line, so one sentence in a cell made
+// the table hundreds of columns wide, unreadable on a phone. Total width comes
+// from the content and is capped; the columns then get the split that prints
+// the fewest lines, so no column is left cramped next to a roomy one.
+const TABLE_MAX_WIDTH = 62
+
+function wrapCell(text: string, width: number): string[] {
+  const out: string[] = []
+  let line = ''
+  for (const word of String(text ?? '').split(/\s+/).filter(Boolean)) {
+    if (displayWidth(word) > width) {
+      if (line) { out.push(line); line = '' }
+      let rest = word
+      while (displayWidth(rest) > width) {
+        let cut = ''
+        for (const ch of rest) {
+          if (displayWidth(cut + ch) > width) break
+          cut += ch
+        }
+        out.push(cut)
+        rest = rest.slice(cut.length)
+      }
+      line = rest
+      continue
+    }
+    if (!line) line = word
+    else if (displayWidth(line) + 1 + displayWidth(word) <= width) line += ' ' + word
+    else { out.push(line); line = word }
+  }
+  if (line) out.push(line)
+  return out.length ? out : ['']
+}
+
+// Printed height first, then the lines of every cell added up. The second term
+// is what balances the columns: between two splits of the same height it takes
+// the one where no column towers over its neighbour.
+function tableCost(rows: string[][], widths: number[]): number {
+  let height = 0
+  let cells = 0
+  for (const r of rows) {
+    const counts = widths.map((w, k) => wrapCell(r[k] ?? '', w).length)
+    height += Math.max(...counts)
+    cells += counts.reduce((a, b) => a + b, 0)
+  }
+  return height * 1000 + cells
+}
+
+function chooseWidths(rows: string[][], maxTotal: number): number[] {
+  const n = Math.max(...rows.map(r => r.length))
+  const natural: number[] = []
+  const floors: number[] = []
+  for (let k = 0; k < n; k++) {
+    const cells = rows.map(r => r[k] ?? '')
+    natural[k] = Math.max(1, ...cells.map(c => displayWidth(c)))
+    const longestWord = Math.max(3, ...cells.flatMap(c => c.split(/\s+/).map(w => displayWidth(w))))
+    floors[k] = Math.min(longestWord, natural[k])
+  }
+  const naturalTotal = natural.reduce((a, b) => a + b, 0) + 3 * n + 1
+  const budget = Math.min(naturalTotal, maxTotal) - 3 * n - 1
+  const widths = floors.slice()
+  let slack = budget - widths.reduce((a, b) => a + b, 0)
+  while (slack < 0) {
+    const i = widths.indexOf(Math.max(...widths))
+    if (widths[i] <= 3) break
+    widths[i]--
+    slack++
+  }
+  while (slack > 0) {
+    const base = tableCost(rows, widths)
+    let best = -1
+    let bestGain = 0
+    for (let k = 0; k < n; k++) {
+      if (widths[k] >= natural[k]) continue
+      widths[k]++
+      const gain = base - tableCost(rows, widths)
+      widths[k]--
+      if (gain > bestGain) { best = k; bestGain = gain }
+    }
+    if (best < 0) {
+      const cand = widths.map((w, k) => (w < natural[k] ? k : -1)).filter(k => k >= 0)
+      if (!cand.length) break
+      best = cand.reduce((a, b) => (natural[b] - widths[b] > natural[a] - widths[a] ? b : a))
+    }
+    widths[best]++
+    slack--
+  }
+  // The pass above only ever adds, so an early handout can leave one column
+  // wide and its neighbour cramped. Move blocks of characters between columns
+  // while it lowers the cost — single characters get stuck on plateaus, since
+  // a word only moves up a line once there is room for all of it.
+  for (let guard = 0; guard < 200; guard++) {
+    const base = tableCost(rows, widths)
+    let moved = false
+    for (let step = 1; step <= 8 && !moved; step++) {
+      for (let from = 0; from < n && !moved; from++) {
+        for (let to = 0; to < n && !moved; to++) {
+          if (from === to) continue
+          if (widths[from] - step < floors[from] || widths[to] + step > natural[to]) continue
+          widths[from] -= step
+          widths[to] += step
+          if (tableCost(rows, widths) < base) moved = true
+          else { widths[from] += step; widths[to] -= step }
+        }
+      }
+    }
+    if (!moved) break
+  }
+  return widths
+}
+
 function mdTablesToAscii(text: string, forFile = false): string {
   const lines = text.split('\n')
   const out: string[] = []
@@ -702,19 +813,28 @@ function mdTablesToAscii(text: string, forFile = false): string {
           })
         }
         widths.length = 0
-        for (const r of rows) r.forEach((c, k) => { widths[k] = Math.max(widths[k] ?? 0, displayWidth(c)) })
-        const cell = (c: string, w: number) => {
-          const space = w - displayWidth(c)
-          const left = Math.floor(space / 2)
+        widths.push(...chooseWidths(rows, TABLE_MAX_WIDTH))
+        const pad = (c: string, w: number, center: boolean) => {
+          const space = Math.max(0, w - displayWidth(c))
+          const left = center ? Math.floor(space / 2) : 0
           return ` ${' '.repeat(left)}${c}${' '.repeat(space - left)} `
         }
         const line = (l: string, fill: string, mid: string, r: string) =>
           l + widths.map(w => fill.repeat(w + 2)).join(mid) + r
-        const row = (r: string[]) => '║' + r.map((c, k) => cell(c ?? '', widths[k])).join('║') + '║'
-        out.push(line('╔', '═', '╦', '╗'), row(rows[0]), line('╠', '═', '╬', '╣'))
+        // A row is as tall as its tallest cell, the rest is padded with blanks.
+        const row = (r: string[], center: boolean) => {
+          const wrapped = widths.map((w, k) => wrapCell(r[k] ?? '', w))
+          const height = Math.max(...wrapped.map(w => w.length))
+          const lines: string[] = []
+          for (let h = 0; h < height; h++) {
+            lines.push('║' + wrapped.map((w, k) => pad(w[h] ?? '', widths[k], center)).join('║') + '║')
+          }
+          return lines
+        }
+        out.push(line('╔', '═', '╦', '╗'), ...row(rows[0], true), line('╠', '═', '╬', '╣'))
         rows.slice(1).forEach((r, idx) => {
           if (idx > 0) out.push(line('╟', '─', '╫', '╢'))
-          out.push(row(r))
+          out.push(...row(r, false))
         })
         out.push(line('╚', '═', '╩', '╝'))
       } else if (total <= 60) {
@@ -1010,7 +1130,7 @@ const mcp = new Server(
       '',
       'Strict surface separation, one conversation lives on one surface. When the turn STARTED from a Discord message: put everything in the reply tool call, end with the literal transcript text "Replied on Discord." and nothing more. When the turn started from the terminal: answer only in the terminal and send NOTHING to Discord (no reply, no react) — permission prompts are the only exception and are relayed automatically. Never refer to the user in the third person; the sender and the terminal user are the same person.',
       '',
-      'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+      'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses. When the user quote-replies to one of your messages, the tag carries in_reply_to_id, in_reply_to_user and in_reply_to (the quoted text) — read it, it is the subject of what they just wrote.',
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
@@ -1968,6 +2088,26 @@ async function handleInbound(msg: Message): Promise<void> {
     atts.push(`${safeAttName(att)} (${att.contentType ?? 'unknown'}, ${kb}KB)`)
   }
 
+  // LOCAL PATCH: quote-reply context. Discord's message_reference is the only
+  // thing that says "this answers that one", and without it a reply like
+  // "yes, that one" arrives with nothing to attach it to. Goes in meta, same
+  // as attachments, since anything in content is forgeable by the sender.
+  let replyMeta: Record<string, string> = {}
+  const refId = msg.reference?.messageId
+  if (refId) {
+    try {
+      const ref = await msg.fetchReference()
+      const quoted = (ref.content ?? '').replace(/\s+/g, ' ').trim()
+      replyMeta = {
+        in_reply_to_id: ref.id,
+        in_reply_to_user: ref.author?.username ?? 'unknown',
+        in_reply_to: quoted ? (quoted.length > 400 ? quoted.slice(0, 400) + '…' : quoted) : '(no text)',
+      }
+    } catch {
+      replyMeta = { in_reply_to_id: refId }
+    }
+  }
+
   // Attachment listing goes in meta only — an in-content annotation is
   // forgeable by any allowlisted sender typing that string.
   const content = msg.content || (atts.length > 0 ? '(attachment)' : '')
@@ -1983,6 +2123,7 @@ async function handleInbound(msg: Message): Promise<void> {
         user_id: msg.author.id,
         ts: msg.createdAt.toISOString(),
         ...(atts.length > 0 ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
+        ...replyMeta,
       },
     },
   }).catch(err => {

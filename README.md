@@ -11,6 +11,8 @@ This is a fork of the official `discord` plugin for Claude Code (Apache-2.0, by 
 - **One channel per session.** Session name = channel name (lowercase, spaces become dashes). No matching channel: the session answers in `#general`. Rename a session with `/rename` and it moves to the new channel within 30 seconds.
 - **No @mention needed** in a session's own channel, and messages in a channel reach only the session bound to it.
 - **Permission prompts in the channel** with Allow / Deny / See more buttons (instead of DM spam).
+- **Readable tables.** Markdown tables ship as a `message.txt` attachment drawn in box characters, cells word-wrapped and capped at 62 columns so they stay readable on a phone.
+- **Quote-reply context.** Reply to one of the bot's messages and the session sees which message you answered, with its text.
 - **Clickable questions.** Claude asks multiple-choice questions with colored buttons, or a popup form with dropdowns and a free-text field for multi-question cases. You can always type a custom answer instead.
 - **Manual rebinding.** Tell a session "talk in #x" (the `bind_channel` tool), or set `DISCORD_CHANNEL=x` when launching.
 - **Missing channel? One click.** When a named session finds no matching channel, it offers in the fallback channel to create it and bind (needs the Manage Channels bot permission). You can also say "talk in #x, create it".
