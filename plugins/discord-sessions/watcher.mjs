@@ -195,6 +195,7 @@ try {
       pid: e.claudePid,
       channelName: e.channelName,
       cwd: e.cwd,
+      sessionId: e.sessionId ?? null,
       spawnedAt: Date.parse(e.boundAt) || Date.now(),
       lastActivity: Date.now(),
     }
@@ -539,6 +540,7 @@ async function wake(channelId, channelName, msg) {
     pid,
     channelName,
     cwd,
+    sessionId: resumeId,
     spawnedAt: Date.now(),
     lastActivity: Date.now(),
   }
@@ -828,7 +830,14 @@ async function spawnForChannel(channelId, channelName) {
   const cwd = canonPath(sess?.cwd ?? config.defaultDir ?? HOME)
   if (!isTrusted(cwd)) return { ok: false, cwd }
   const pid = await spawnClaude(cwd, channelName, sess?.sessionId ?? null, state.modelOverrides?.[channelId])
-  state.spawned[channelId] = { pid, channelName, cwd, spawnedAt: Date.now(), lastActivity: Date.now() }
+  state.spawned[channelId] = {
+    pid,
+    channelName,
+    cwd,
+    sessionId: sess?.sessionId ?? null,
+    spawnedAt: Date.now(),
+    lastActivity: Date.now(),
+  }
   saveState()
   log(`#${channelName}: spawned claude pid ${pid} for injected command`)
   return { ok: true, cwd }
@@ -849,9 +858,13 @@ async function statusText() {
   const spawnedRows = Object.values(state.spawned)
     .filter(s => pidAlive(s.pid))
     .map(s => {
-      const left = Math.max(0, Math.round((s.lastActivity + idleMs - Date.now()) / 60000))
+      // Same activity rule as the reaper: transcript writes count too, so a
+      // session that is working shows a full timer instead of a shrinking one.
+      const active = Math.max(s.lastActivity, lastWriteMs(s))
+      const left = Math.max(0, Math.round((active + idleMs - Date.now()) / 60000))
       const age = Math.max(0, Math.round((Date.now() - s.spawnedAt) / 60000))
-      return `#${s.channelName} — \`${s.cwd}\` — background, up ${age} min, shuts down after ~${left} more min of silence`
+      const working = Date.now() - lastWriteMs(s) < 60_000 ? ', working right now' : ''
+      return `#${s.channelName} — \`${s.cwd}\` — background, up ${age} min${working}, shuts down after ~${left} more min of silence`
     })
   const terminals = listLive().filter(r => r.includes('(terminal)'))
   rows.push(...(spawnedRows.length > 0 ? spawnedRows : ['No background sessions.']), ...terminals)
@@ -1069,6 +1082,56 @@ function listLive() {
 }
 
 // ── idle reaper ─────────────────────────────────────────────────────────────
+// Discord traffic is not the only sign of life: a session can work for an hour
+// on one message without posting anything. Claude Code appends to the session
+// transcript on every step, so its mtime is the real "still working" signal.
+// Without this the reaper killed sessions mid-task and their work was lost.
+function transcriptPathFor(s) {
+  if (s.transcript && existsSync(s.transcript)) return s.transcript
+  let sessionId = s.sessionId
+  if (!sessionId) {
+    // A fresh spawn gets its session id only once its server binds and stamps
+    // live/<pid>.json. Pick it up from there, then remember it.
+    try {
+      for (const f of readdirSync(LIVE_DIR)) {
+        const e = readJson(join(LIVE_DIR, f), null)
+        if (e?.claudePid === s.pid && e.sessionId) { sessionId = e.sessionId; break }
+      }
+    } catch {}
+  }
+  if (!sessionId) return null
+  for (const [file, entry] of Object.entries(state.index ?? {})) {
+    if (entry?.sessionId === sessionId && existsSync(file)) {
+      s.sessionId = sessionId
+      s.transcript = file
+      return file
+    }
+  }
+  // Freshly spawned session: its transcript exists on disk before the index
+  // has been rebuilt, so look the file up directly.
+  try {
+    for (const d of readdirSync(PROJECTS_DIR)) {
+      const p = join(PROJECTS_DIR, d, `${sessionId}.jsonl`)
+      if (existsSync(p)) {
+        s.sessionId = sessionId
+        s.transcript = p
+        return p
+      }
+    }
+  } catch {}
+  return null
+}
+
+function lastWriteMs(s) {
+  const p = transcriptPathFor(s)
+  if (!p) return 0
+  try {
+    return statSync(p).mtimeMs
+  } catch {
+    return 0
+  }
+}
+
 setInterval(() => {
   const idleMs = Math.max(1, config.idleMinutes) * 60 * 1000
   for (const [cid, s] of Object.entries(state.spawned)) {
@@ -1076,6 +1139,11 @@ setInterval(() => {
       delete state.spawned[cid]
       saveState()
       continue
+    }
+    const wrote = lastWriteMs(s)
+    if (wrote > s.lastActivity) {
+      s.lastActivity = wrote
+      saveState()
     }
     if (Date.now() - s.lastActivity > idleMs) {
       log(`#${s.channelName}: idle ${config.idleMinutes}min, shutting down pid ${s.pid}`)
