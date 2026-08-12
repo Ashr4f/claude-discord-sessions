@@ -557,7 +557,7 @@ const HELP_TEXT = [
   '`/restart` — restart background session(s) (`all` or one channel)',
   '`/open` / `/hide` — show a background session\'s live terminal on the PC screen / tuck it away',
   '`/model` — show this channel\'s model, or switch it (applies live to a background session)',
-  '`/rename` — rename the bot in this server',
+  '`/rename-bot` — rename the bot in this server',
   '`/update` — update Claude Code itself',
   '`/status` — watcher uptime, Claude version, idle timers',
   '`/logs` — recent watcher log lines',
@@ -1314,7 +1314,7 @@ client.on('interactionCreate', async i => {
           await i.editReply(await openText(i.options.getString('channel', true), 'hide'))
           return
         }
-        case 'rename': {
+        case 'rename-bot': {
           const nick = i.options.getString('name', true).trim().slice(0, 32)
           try {
             const me = await i.guild.members.fetchMe()
@@ -1417,7 +1417,7 @@ client.once('ready', c => {
             ],
           },
           {
-            name: 'rename',
+            name: 'rename-bot',
             description: 'Rename the bot in this server (per-server nickname)',
             options: [
               { type: 3, name: 'name', description: 'New display name (1-32 chars)', required: true },
