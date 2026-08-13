@@ -1028,7 +1028,33 @@ async function usageText() {
   if (extra?.is_enabled && extra.used_credits > 0) {
     rows.push(`Extra credits used: ${(extra.used_credits / 10 ** (extra.decimal_places ?? 2)).toFixed(2)} ${extra.currency ?? ''}`)
   }
+  const cost = costText()
+  if (cost) rows.push('', cost)
   return rows.join('\n')
+}
+
+// What the plan usage would have cost on the API. The usage endpoint only
+// returns percentages (limit_dollars is null on a subscription), so the money
+// comes from Claude Code's own tally in ~/.claude.json: per project, per model,
+// cumulative since install. Same numbers the terminal's /cost is built from.
+function costText() {
+  const cfg = readJson(join(HOME, '.claude.json'), null)
+  if (!cfg?.projects) return ''
+  const perModel = {}
+  for (const p of Object.values(cfg.projects)) {
+    for (const [model, u] of Object.entries(p.lastModelUsage ?? {})) {
+      if (typeof u?.costUSD !== 'number') continue
+      const name = model.replace(/^claude-/, '')
+      perModel[name] = (perModel[name] ?? 0) + u.costUSD
+    }
+  }
+  const entries = Object.entries(perModel).sort((a, b) => b[1] - a[1])
+  if (entries.length === 0) return ''
+  const total = entries.reduce((s, [, v]) => s + v, 0)
+  const top = entries.slice(0, 4).map(([m, v]) => `${m} $${v.toFixed(0)}`)
+  const rest = entries.slice(4).reduce((s, [, v]) => s + v, 0)
+  if (rest > 0) top.push(`other $${rest.toFixed(0)}`)
+  return [`**Equivalent API cost** — $${total.toFixed(2)} total, all projects since install`, top.join(' · ')].join('\n')
 }
 
 // Bot presence shows the numbers all the time, refreshed every 10 min.
