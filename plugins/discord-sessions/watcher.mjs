@@ -36,7 +36,8 @@ import {
   appendFileSync,
   realpathSync,
 } from 'fs'
-import { homedir, hostname } from 'os'
+import { homedir, hostname, networkInterfaces } from 'os'
+import { createHash } from 'crypto'
 import { join, basename } from 'path'
 import { execFileSync, spawn } from 'child_process'
 
@@ -848,7 +849,7 @@ async function statusText() {
   const up = Math.round((Date.now() - STARTED_AT) / 60000)
   const idleMs = Math.max(1, config.idleMinutes) * 60 * 1000
   const rows = [
-    `**Watcher** on \`${MACHINE}\` — up ${Math.floor(up / 60)}h${up % 60}m (pid ${process.pid}, ${process.platform}) — Claude ${cachedVersion}`,
+    `**Watcher** on \`${MACHINE}\` (id ${MACHINE_ID}) — up ${Math.floor(up / 60)}h${up % 60}m (pid ${process.pid}, ${process.platform}) — Claude ${cachedVersion}`,
     `Idle shutdown: ${config.idleMinutes} min · default folder: \`${config.defaultDir}\` · guild: ${routing.guildId ?? 'any'}`,
   ]
   try {
@@ -873,7 +874,8 @@ async function statusText() {
     rows.push('', '**Other machines**')
     for (const p of others) {
       const live = (p.live ?? []).map(n => `#${n}`).join(', ') || 'none'
-      rows.push(`\`${p.machine}\` (${p.platform}) — ${live} — heartbeat ${Math.round((Date.now() - (p.ts ?? 0)) / 1000)}s ago`)
+      const label = p.machine === MACHINE ? `${p.machine}#${p.id}` : p.machine
+      rows.push(`\`${label}\` (${p.platform}) — ${live} — heartbeat ${Math.round((Date.now() - (p.ts ?? 0)) / 1000)}s ago`)
     }
   }
   return rows.join('\n')
@@ -1032,39 +1034,9 @@ async function usageText() {
       rows.push(`Week (${l.scope.model.display_name}): \`${usageBar(l.percent)}\` ${l.percent}% — ${resetsIn(l.resets_at)}`)
     }
   }
-  const extra = extraLine(u)
-  if (extra) rows.push(extra)
   const cost = costText()
   if (cost) rows.push('', cost)
   return rows.join('\n')
-}
-
-// The extra-usage budget (credits that keep you working past the plan limits).
-// Amounts come as minor units, and the two blocks disagree on which fields are
-// filled depending on whether the budget is enabled, so read both.
-function extraLine(u) {
-  const e = u.extra_usage
-  const s = u.spend
-  const currency = e?.currency ?? s?.used?.currency ?? ''
-  const dp = e?.decimal_places ?? 2
-  const exp = s?.used?.exponent ?? 2
-  const used =
-    typeof e?.used_credits === 'number' ? e.used_credits / 10 ** dp
-    : typeof s?.used?.amount_minor === 'number' ? s.used.amount_minor / 10 ** exp
-    : null
-  const limit =
-    typeof e?.monthly_limit === 'number' ? e.monthly_limit / 10 ** dp
-    : typeof s?.limit === 'number' ? s.limit / 10 ** exp
-    : null
-  if (e && e.is_enabled === false) {
-    const why = e.disabled_reason ? ` (${e.disabled_reason})` : ''
-    const spent = used ? `, ${used.toFixed(2)} ${currency} spent` : ''
-    return `Extra usage budget: off${why}${spent}`
-  }
-  if (used == null) return ''
-  if (limit == null) return `Extra usage budget: ${used.toFixed(2)} ${currency} spent, no monthly cap set`
-  const pct = Math.round((used / limit) * 100)
-  return `Extra usage budget: \`${usageBar(pct)}\` ${used.toFixed(2)} / ${limit.toFixed(2)} ${currency} (${pct}%)`
 }
 
 // What the plan usage would have cost on the API. The usage endpoint only
@@ -1242,6 +1214,26 @@ const client = new Client({
 // session; ties break on machine name, so both sides reach the same verdict
 // without talking to each other. Alone on one machine, nothing changes.
 const MACHINE = String(config.machine ?? hostname()).trim()
+// The display name is not an identity: two PCs can both be called "desktop",
+// and then each would filter the other out as "itself" and both would wake.
+// The identity is a fingerprint of the machine (first real MAC address, else a
+// random id kept in the state file), so names may collide without any harm.
+const MACHINE_ID = machineFingerprint()
+
+function machineFingerprint() {
+  const macs = Object.values(networkInterfaces())
+    .flat()
+    .filter(n => n && !n.internal && n.mac && n.mac !== '00:00:00:00:00:00')
+    .map(n => n.mac)
+    .sort()
+  if (macs.length > 0) return createHash('sha1').update(macs[0]).digest('hex').slice(0, 8)
+  if (!state.machineId) {
+    state.machineId = createHash('sha1').update(`${hostname()}|${HOME}|${Math.random()}`).digest('hex').slice(0, 8)
+    saveState()
+  }
+  return state.machineId
+}
+
 const CONTROL_CHANNEL = config.controlChannel ?? 'claude-watchers'
 const PEER_TTL_MS = 3 * 60 * 1000
 let controlChannel = null
@@ -1259,7 +1251,7 @@ function heartbeatBody() {
     .map(s => s.channelName)
   let known = knownSessionNames()
   const payload = () =>
-    JSON.stringify({ machine: MACHINE, platform: process.platform, pid: process.pid, ts: Date.now(), live, known })
+    JSON.stringify({ id: MACHINE_ID, machine: MACHINE, platform: process.platform, pid: process.pid, ts: Date.now(), live, known })
   // Discord caps a message at 2000 chars; drop the oldest names if needed.
   while (payload().length > 1700 && known.length > 0) known = known.slice(0, -1)
   return `\`${MACHINE}\` · ${process.platform} · ${live.length} live\n\`\`\`json\n${payload()}\n\`\`\``
@@ -1294,10 +1286,10 @@ async function setupControl() {
       log(`created #${CONTROL_CHANNEL} for watcher coordination`)
     }
     const recent = await controlChannel.messages.fetch({ limit: 50 })
-    heartbeatMsg = recent.find(m => m.author.id === client.user.id && m.content.startsWith(`\`${MACHINE}\``)) ?? null
+    heartbeatMsg = recent.find(m => m.author.id === client.user.id && m.content.includes(`"id":"${MACHINE_ID}"`)) ?? null
     await beat()
     setInterval(() => void beat(), 60_000).unref?.()
-    log(`coordination on as \`${MACHINE}\` in #${CONTROL_CHANNEL}`)
+    log(`coordination on as ${MACHINE} (${MACHINE_ID}) in #${CONTROL_CHANNEL}`)
   } catch (err) {
     log(`coordination off (${err.message ?? err}), treating this as the only machine`)
     controlChannel = null
@@ -1316,7 +1308,7 @@ async function peers() {
       if (!block) continue
       try {
         const p = JSON.parse(block[1])
-        if (!p.machine || p.machine === MACHINE) continue
+        if (!p.id || p.id === MACHINE_ID) continue
         if (Date.now() - (p.ts ?? 0) > PEER_TTL_MS) continue
         found.push(p)
       } catch {}
@@ -1331,27 +1323,27 @@ async function ownsWake(channelId, channelName) {
   const others = await peers()
   if (others.length === 0) return true
   const pinned = config.channels?.[channelName] ?? config.channels?.[channelId]
-  if (pinned) return pinned === MACHINE
+  if (pinned) return pinned === MACHINE || pinned === MACHINE_ID
   const iKnow = knownSessionNames().includes(channelName)
   const theyKnow = others.filter(p => (p.known ?? []).includes(channelName))
   if (iKnow && theyKnow.length === 0) return true
   if (!iKnow && theyKnow.length > 0) return false
-  const pool = [MACHINE, ...(iKnow ? theyKnow : others).map(p => p.machine)].sort()
-  return pool[0] === MACHINE
+  const pool = [MACHINE_ID, ...(iKnow ? theyKnow : others).map(p => p.id)].sort()
+  return pool[0] === MACHINE_ID
 }
 
-// Lowest machine name answers the server-wide commands.
+// Lowest machine id answers the server-wide commands.
 async function isPrimary() {
   const others = await peers()
   if (others.length === 0) return true
-  return [MACHINE, ...others.map(p => p.machine)].sort()[0] === MACHINE
+  return [MACHINE_ID, ...others.map(p => p.id)].sort()[0] === MACHINE_ID
 }
 
 // Machine hosting a live session for that channel, null if nobody does.
 async function machineForChannelName(name) {
-  if (Object.values(state.spawned).some(s => s.channelName === name && pidAlive(s.pid))) return MACHINE
+  if (Object.values(state.spawned).some(s => s.channelName === name && pidAlive(s.pid))) return MACHINE_ID
   const others = await peers()
-  return others.find(p => (p.live ?? []).includes(name))?.machine ?? null
+  return others.find(p => (p.live ?? []).includes(name))?.id ?? null
 }
 
 const GLOBAL_COMMANDS = new Set(['status', 'sessions', 'logs', 'usage', 'help', 'update', 'killall', 'rename-bot'])
@@ -1374,7 +1366,7 @@ async function shouldAnswer(i) {
   }
   if (!target || target.toLowerCase() === 'all') return isPrimary()
   const host = await machineForChannelName(target)
-  if (host) return host === MACHINE
+  if (host) return host === MACHINE_ID
   return ownsWake(i.channelId, target)
 }
 

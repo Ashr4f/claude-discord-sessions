@@ -2,7 +2,7 @@
   "idleMinutes": 30,
   "defaultDir": "C:\\Users\\ashra",
 
-  "//machine": "Name of this PC in the Discord control channel. Defaults to the hostname. Only matters when several machines share the same bot.",
+  "//machine": "Label for this PC in the Discord control channel. Defaults to the hostname, purely cosmetic: identity comes from a MAC fingerprint, so two machines may share a name.",
   "machine": "desktop",
 
   "//controlChannel": "Channel the watchers use to see each other (created on first run). Default: claude-watchers.",
