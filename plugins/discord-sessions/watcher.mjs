@@ -526,7 +526,7 @@ async function wake(channelId, channelName, msg) {
 
   let pid
   try {
-    pid = await spawnClaude(cwd, channelName, resumeId, state.modelOverrides?.[channelId])
+    pid = await spawnClaude(cwd, channelName, resumeId, modelForWake(channelId, channelName))
   } catch (err) {
     log(`#${channelName}: spawn failed: ${err}`)
     removeHourglass(msg)
@@ -610,7 +610,7 @@ async function restartOne(cid, s) {
   }
   indexSessions()
   const sess = findSessionByName(s.channelName)
-  const pid = await spawnClaude(sess?.cwd ?? s.cwd, s.channelName, sess?.sessionId ?? null, state.modelOverrides?.[cid])
+  const pid = await spawnClaude(sess?.cwd ?? s.cwd, s.channelName, sess?.sessionId ?? null, modelForWake(cid, s.channelName))
   state.spawned[cid] = { ...s, pid, spawnedAt: Date.now(), lastActivity: Date.now() }
   saveState()
 }
@@ -829,7 +829,7 @@ async function spawnForChannel(channelId, channelName) {
   const sess = findSessionByName(channelName)
   const cwd = canonPath(sess?.cwd ?? config.defaultDir ?? HOME)
   if (!isTrusted(cwd)) return { ok: false, cwd }
-  const pid = await spawnClaude(cwd, channelName, sess?.sessionId ?? null, state.modelOverrides?.[channelId])
+  const pid = await spawnClaude(cwd, channelName, sess?.sessionId ?? null, modelForWake(channelId, channelName))
   state.spawned[channelId] = {
     pid,
     channelName,
@@ -894,6 +894,7 @@ const MODEL_MAP = {
 }
 
 // Last model that actually answered in the channel's session (transcript tail).
+// The `[1m]` suffix (1M context variant) is part of the model id, keep it.
 function currentModelForChannel(channelName) {
   const hit = Object.entries(state.index)
     .filter(([, e]) => e.title && slugify(e.title) === channelName)
@@ -901,11 +902,21 @@ function currentModelForChannel(channelName) {
   if (!hit) return null
   try {
     const tail = readTail(hit[0], 512 * 1024)
-    const ms = [...tail.matchAll(/"model":"(claude-[a-z0-9.-]+)"/g)]
+    const ms = [...tail.matchAll(/"model":"(claude-[a-z0-9.-]+(?:\[1m\])?)"/g)]
     return ms.length > 0 ? ms[ms.length - 1][1] : null
   } catch {
     return null
   }
+}
+
+// Model to wake a channel with. Without this a channel with no explicit
+// override falls back to the global default in ~/.claude/settings.json, so
+// switching the model anywhere moved every channel. Each channel now sticks
+// to what it last answered with, and only its own /model changes that.
+function modelForWake(channelId, channelName) {
+  const override = state.modelOverrides?.[channelId]
+  if (override) return override
+  return currentModelForChannel(channelName) ?? undefined
 }
 
 async function modelText(channelName, channelId, choice) {
@@ -914,10 +925,12 @@ async function modelText(channelName, channelId, choice) {
     indexSessions()
     const cur = currentModelForChannel(channelName)
     const override = state.modelOverrides[channelId]
+    const next = modelForWake(channelId, channelName)
     return [
       `#${channelName}:`,
       `Last model that answered: ${cur ? `\`${cur}\`` : 'unknown (no session history found)'}`,
-      `Override for wakes: ${override ? `\`${override}\`` : 'none (account default)'}`,
+      `Pinned here: ${override ? `\`${override}\`` : 'nothing, it keeps whatever it last used'}`,
+      `Next wake uses: ${next ? `\`${next}\`` : 'the account default'}`,
     ].join('\n')
   }
   if (choice === 'default') {
@@ -927,7 +940,7 @@ async function modelText(channelName, channelId, choice) {
     state.modelOverrides[channelId] = MODEL_MAP[choice] ?? choice
     saveState()
   }
-  const target = state.modelOverrides[channelId]
+  const target = modelForWake(channelId, channelName)
   let note = 'Applies from the next wake.'
   const running = state.spawned[channelId]
   if (running && pidAlive(running.pid)) {
@@ -938,7 +951,7 @@ async function modelText(channelName, channelId, choice) {
       note = `⚠️ Restart failed (${err.message}) — applies on next wake.`
     }
   }
-  return `Model for #${channelName}: ${target ? `\`${target}\`` : 'account default'}. ${note}`
+  return `Model for #${channelName}: ${target ? `\`${target}\`` : 'account default'}. ${note} Other channels are untouched.`
 }
 
 // Show/hide the hidden console window of a background session (Windows).
