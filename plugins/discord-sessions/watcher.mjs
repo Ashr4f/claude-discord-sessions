@@ -36,7 +36,7 @@ import {
   appendFileSync,
   realpathSync,
 } from 'fs'
-import { homedir } from 'os'
+import { homedir, hostname } from 'os'
 import { join, basename } from 'path'
 import { execFileSync, spawn } from 'child_process'
 
@@ -848,7 +848,7 @@ async function statusText() {
   const up = Math.round((Date.now() - STARTED_AT) / 60000)
   const idleMs = Math.max(1, config.idleMinutes) * 60 * 1000
   const rows = [
-    `**Watcher** — up ${Math.floor(up / 60)}h${up % 60}m (pid ${process.pid}, ${process.platform}) — Claude ${cachedVersion}`,
+    `**Watcher** on \`${MACHINE}\` — up ${Math.floor(up / 60)}h${up % 60}m (pid ${process.pid}, ${process.platform}) — Claude ${cachedVersion}`,
     `Idle shutdown: ${config.idleMinutes} min · default folder: \`${config.defaultDir}\` · guild: ${routing.guildId ?? 'any'}`,
   ]
   try {
@@ -868,6 +868,14 @@ async function statusText() {
     })
   const terminals = listLive().filter(r => r.includes('(terminal)'))
   rows.push(...(spawnedRows.length > 0 ? spawnedRows : ['No background sessions.']), ...terminals)
+  const others = await peers()
+  if (others.length > 0) {
+    rows.push('', '**Other machines**')
+    for (const p of others) {
+      const live = (p.live ?? []).map(n => `#${n}`).join(', ') || 'none'
+      rows.push(`\`${p.machine}\` (${p.platform}) — ${live} — heartbeat ${Math.round((Date.now() - (p.ts ?? 0)) / 1000)}s ago`)
+    }
+  }
   return rows.join('\n')
 }
 
@@ -1024,13 +1032,39 @@ async function usageText() {
       rows.push(`Week (${l.scope.model.display_name}): \`${usageBar(l.percent)}\` ${l.percent}% — ${resetsIn(l.resets_at)}`)
     }
   }
-  const extra = u.extra_usage
-  if (extra?.is_enabled && extra.used_credits > 0) {
-    rows.push(`Extra credits used: ${(extra.used_credits / 10 ** (extra.decimal_places ?? 2)).toFixed(2)} ${extra.currency ?? ''}`)
-  }
+  const extra = extraLine(u)
+  if (extra) rows.push(extra)
   const cost = costText()
   if (cost) rows.push('', cost)
   return rows.join('\n')
+}
+
+// The extra-usage budget (credits that keep you working past the plan limits).
+// Amounts come as minor units, and the two blocks disagree on which fields are
+// filled depending on whether the budget is enabled, so read both.
+function extraLine(u) {
+  const e = u.extra_usage
+  const s = u.spend
+  const currency = e?.currency ?? s?.used?.currency ?? ''
+  const dp = e?.decimal_places ?? 2
+  const exp = s?.used?.exponent ?? 2
+  const used =
+    typeof e?.used_credits === 'number' ? e.used_credits / 10 ** dp
+    : typeof s?.used?.amount_minor === 'number' ? s.used.amount_minor / 10 ** exp
+    : null
+  const limit =
+    typeof e?.monthly_limit === 'number' ? e.monthly_limit / 10 ** dp
+    : typeof s?.limit === 'number' ? s.limit / 10 ** exp
+    : null
+  if (e && e.is_enabled === false) {
+    const why = e.disabled_reason ? ` (${e.disabled_reason})` : ''
+    const spent = used ? `, ${used.toFixed(2)} ${currency} spent` : ''
+    return `Extra usage budget: off${why}${spent}`
+  }
+  if (used == null) return ''
+  if (limit == null) return `Extra usage budget: ${used.toFixed(2)} ${currency} spent, no monthly cap set`
+  const pct = Math.round((used / limit) * 100)
+  return `Extra usage budget: \`${usageBar(pct)}\` ${used.toFixed(2)} / ${limit.toFixed(2)} ${currency} (${pct}%)`
 }
 
 // What the plan usage would have cost on the API. The usage endpoint only
@@ -1199,11 +1233,157 @@ const client = new Client({
   partials: [Partials.Channel],
 })
 
+// ── several machines, one bot ────────────────────────────────────────────────
+// Two PCs running this watcher share the same bot, so both receive every
+// message and both would wake a session for it: two sessions, two answers.
+// They coordinate through a control channel in the same server. Each machine
+// keeps one heartbeat message there with its name, its live sessions and the
+// session names it has on disk. A wake belongs to the machine that knows the
+// session; ties break on machine name, so both sides reach the same verdict
+// without talking to each other. Alone on one machine, nothing changes.
+const MACHINE = String(config.machine ?? hostname()).trim()
+const CONTROL_CHANNEL = config.controlChannel ?? 'claude-watchers'
+const PEER_TTL_MS = 3 * 60 * 1000
+let controlChannel = null
+let heartbeatMsg = null
+
+function knownSessionNames() {
+  const names = new Set()
+  for (const e of Object.values(state.index ?? {})) if (e?.title) names.add(slugify(e.title))
+  return [...names]
+}
+
+function heartbeatBody() {
+  const live = Object.values(state.spawned)
+    .filter(s => pidAlive(s.pid))
+    .map(s => s.channelName)
+  let known = knownSessionNames()
+  const payload = () =>
+    JSON.stringify({ machine: MACHINE, platform: process.platform, pid: process.pid, ts: Date.now(), live, known })
+  // Discord caps a message at 2000 chars; drop the oldest names if needed.
+  while (payload().length > 1700 && known.length > 0) known = known.slice(0, -1)
+  return `\`${MACHINE}\` · ${process.platform} · ${live.length} live\n\`\`\`json\n${payload()}\n\`\`\``
+}
+
+async function beat() {
+  if (!controlChannel) return
+  const body = heartbeatBody()
+  try {
+    if (heartbeatMsg) {
+      await heartbeatMsg.edit(body)
+      return
+    }
+  } catch {
+    heartbeatMsg = null
+  }
+  try {
+    heartbeatMsg = await controlChannel.send(body)
+  } catch (err) {
+    log(`heartbeat failed: ${err.message ?? err}`)
+  }
+}
+
+async function setupControl() {
+  if (!routing.guildId || config.multiMachine === false) return
+  try {
+    const guild = await client.guilds.fetch(routing.guildId)
+    const chans = await guild.channels.fetch()
+    controlChannel = chans.find(c => c?.name === CONTROL_CHANNEL && typeof c.send === 'function') ?? null
+    if (!controlChannel) {
+      controlChannel = await guild.channels.create({ name: CONTROL_CHANNEL, reason: 'Claude watcher coordination' })
+      log(`created #${CONTROL_CHANNEL} for watcher coordination`)
+    }
+    const recent = await controlChannel.messages.fetch({ limit: 50 })
+    heartbeatMsg = recent.find(m => m.author.id === client.user.id && m.content.startsWith(`\`${MACHINE}\``)) ?? null
+    await beat()
+    setInterval(() => void beat(), 60_000).unref?.()
+    log(`coordination on as \`${MACHINE}\` in #${CONTROL_CHANNEL}`)
+  } catch (err) {
+    log(`coordination off (${err.message ?? err}), treating this as the only machine`)
+    controlChannel = null
+  }
+}
+
+let peerCache = { at: 0, list: [] }
+async function peers() {
+  if (!controlChannel) return []
+  if (Date.now() - peerCache.at < 15_000) return peerCache.list
+  const found = []
+  try {
+    const msgs = await controlChannel.messages.fetch({ limit: 50 })
+    for (const m of msgs.values()) {
+      const block = m.content.match(/```json\n([\s\S]*?)\n```/)
+      if (!block) continue
+      try {
+        const p = JSON.parse(block[1])
+        if (!p.machine || p.machine === MACHINE) continue
+        if (Date.now() - (p.ts ?? 0) > PEER_TTL_MS) continue
+        found.push(p)
+      } catch {}
+    }
+  } catch {}
+  peerCache = { at: Date.now(), list: found }
+  return found
+}
+
+// Which machine wakes this channel.
+async function ownsWake(channelId, channelName) {
+  const others = await peers()
+  if (others.length === 0) return true
+  const pinned = config.channels?.[channelName] ?? config.channels?.[channelId]
+  if (pinned) return pinned === MACHINE
+  const iKnow = knownSessionNames().includes(channelName)
+  const theyKnow = others.filter(p => (p.known ?? []).includes(channelName))
+  if (iKnow && theyKnow.length === 0) return true
+  if (!iKnow && theyKnow.length > 0) return false
+  const pool = [MACHINE, ...(iKnow ? theyKnow : others).map(p => p.machine)].sort()
+  return pool[0] === MACHINE
+}
+
+// Lowest machine name answers the server-wide commands.
+async function isPrimary() {
+  const others = await peers()
+  if (others.length === 0) return true
+  return [MACHINE, ...others.map(p => p.machine)].sort()[0] === MACHINE
+}
+
+// Machine hosting a live session for that channel, null if nobody does.
+async function machineForChannelName(name) {
+  if (Object.values(state.spawned).some(s => s.channelName === name && pidAlive(s.pid))) return MACHINE
+  const others = await peers()
+  return others.find(p => (p.live ?? []).includes(name))?.machine ?? null
+}
+
+const GLOBAL_COMMANDS = new Set(['status', 'sessions', 'logs', 'usage', 'help', 'update', 'killall', 'rename-bot'])
+
+// Both machines see the interaction; only one may answer it (Discord rejects
+// the second). Channel-scoped commands go to the machine hosting that
+// channel's session, the rest to the primary.
+async function shouldAnswer(i) {
+  const others = await peers()
+  if (others.length === 0) return true
+  const name = i.commandName
+  if (GLOBAL_COMMANDS.has(name)) return isPrimary()
+  let target = null
+  if (name === 'kill' || name === 'open' || name === 'hide') target = i.options.getString('channel', false)
+  else if (name === 'restart') target = i.options.getString('target', false)
+  else {
+    const ch = i.channel
+    const isThread = typeof ch?.isThread === 'function' && ch.isThread()
+    target = isThread ? ch.parent?.name : ch?.name
+  }
+  if (!target || target.toLowerCase() === 'all') return isPrimary()
+  const host = await machineForChannelName(target)
+  if (host) return host === MACHINE
+  return ownsWake(i.channelId, target)
+}
+
 client.on('messageCreate', async msg => {
   try {
     if (!msg.guildId) return
     if (routing.guildId && msg.guildId !== routing.guildId) return
     if (msg.system) return
+    if (controlChannel && msg.channelId === controlChannel.id) return
 
     const isThread = typeof msg.channel.isThread === 'function' && msg.channel.isThread()
     const channelId = isThread ? (msg.channel.parentId ?? msg.channelId) : msg.channelId
@@ -1298,6 +1478,11 @@ client.on('messageCreate', async msg => {
       return
     }
 
+    if (!(await ownsWake(channelId, channelName))) {
+      log(`#${channelName}: another machine owns this channel, not waking here`)
+      return
+    }
+
     waking.add(channelId)
     try {
       await wake(channelId, channelName, msg)
@@ -1332,6 +1517,8 @@ async function queueSkill(interaction, skill) {
 
 client.on('interactionCreate', async i => {
   try {
+    // Every machine sees the interaction, only one is allowed to answer it.
+    if (i.isChatInputCommand?.() && !(await shouldAnswer(i))) return
     if (i.isAutocomplete()) {
       const q = (i.options.getFocused() ?? '').toLowerCase()
       if (i.commandName === 'skill') {
@@ -1474,7 +1661,8 @@ client.on('guildCreate', async guild => {
 })
 
 client.once('ready', c => {
-  log(`watcher connected as ${c.user.tag} (pid ${process.pid}, idle ${config.idleMinutes}min, default ${config.defaultDir})`)
+  log(`watcher connected as ${c.user.tag} (pid ${process.pid}, machine ${MACHINE}, idle ${config.idleMinutes}min, default ${config.defaultDir})`)
+  void setupControl()
   // Slash commands — guild-scoped registration is instant (global takes up
   // to an hour). type 3 = STRING option.
   if (routing.guildId) {
