@@ -1199,6 +1199,74 @@ setInterval(() => {
   }
 }, 60_000)
 
+// ── sessions stalled on an API error ────────────────────────────────────────
+// A 529 from the API ends the turn with an "API Error: ..." line in the
+// transcript and nothing after it. The session then sits there doing nothing
+// until the idle reaper takes it, and the channel is never told: you come back
+// hours later thinking the work went on. Detect that state, pick the work back
+// up a few times, and say it in the channel either way.
+const MAX_AUTO_RESUME = 3
+
+function transcriptStall(s) {
+  const p = transcriptPathFor(s)
+  if (!p) return null
+  let tail = ''
+  try {
+    tail = readTail(p, 256 * 1024)
+  } catch {
+    return null
+  }
+  const lines = tail.split('\n').filter(Boolean)
+  for (let i = lines.length - 1; i >= 0; i--) {
+    let j
+    try {
+      j = JSON.parse(lines[i])
+    } catch {
+      continue
+    }
+    if (j.type !== 'assistant') continue
+    const c = j.message?.content
+    const text = typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => (x.type === 'text' ? x.text : '')).join(' ') : ''
+    const m = text.match(/^API Error: (.+)/)
+    return m ? { at: j.timestamp ?? String(i), reason: m[1].split('.')[0].slice(0, 120) } : null
+  }
+  return null
+}
+
+async function announce(channelId, text) {
+  try {
+    const ch = await client.channels.fetch(channelId)
+    await ch?.send(text)
+  } catch (err) {
+    log(`announce failed on ${channelId}: ${err.message ?? err}`)
+  }
+}
+
+setInterval(() => {
+  for (const [cid, s] of Object.entries(state.spawned)) {
+    if (!pidAlive(s.pid)) continue
+    // Still writing means still working, leave it alone.
+    if (Date.now() - lastWriteMs(s) < 60_000) continue
+    const stall = transcriptStall(s)
+    if (!stall) continue
+    if (s.resume?.at !== stall.at) s.resume = { at: stall.at, n: 0 }
+    if (s.resume.n >= MAX_AUTO_RESUME) continue
+    s.resume.n++
+    saveState()
+    writeCommandFile(cid, 'Your last turn stopped on an API error. Continue the work where it stopped, do not start over.', {
+      username: 'watcher',
+      id: allowFrom[0] ?? '0',
+    })
+    log(`#${s.channelName}: stalled on "${stall.reason}", auto-resume ${s.resume.n}/${MAX_AUTO_RESUME}`)
+    void announce(
+      cid,
+      s.resume.n < MAX_AUTO_RESUME
+        ? `⚠️ Stopped on an API error (${stall.reason}). Picking the work back up, try ${s.resume.n}/${MAX_AUTO_RESUME}.`
+        : `⚠️ Stopped on an API error (${stall.reason}) and it keeps failing. Last automatic retry (${s.resume.n}/${MAX_AUTO_RESUME}), after that send a message to continue.`,
+    )
+  }
+}, 60_000)
+
 // ── gateway ─────────────────────────────────────────────────────────────────
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
