@@ -36,7 +36,7 @@ import {
   appendFileSync,
   realpathSync,
 } from 'fs'
-import { homedir, hostname, networkInterfaces } from 'os'
+import { homedir, hostname } from 'os'
 import { createHash } from 'crypto'
 import { join, basename } from 'path'
 import { execFileSync, spawn } from 'child_process'
@@ -1305,18 +1305,14 @@ const MACHINE = String(config.machine ?? hostname()).trim()
 // random id kept in the state file), so names may collide without any harm.
 const MACHINE_ID = machineFingerprint()
 
+// Must be stable across restarts: MAC addresses are not (a VPN adapter coming
+// up reorders them and the id changes, which orphans the heartbeat message).
+// Hostname + home + platform is stable and differs between machines even when
+// they share a display name. machineId in watcher.json overrides it for the
+// rare case of two machines with the same hostname and the same user.
 function machineFingerprint() {
-  const macs = Object.values(networkInterfaces())
-    .flat()
-    .filter(n => n && !n.internal && n.mac && n.mac !== '00:00:00:00:00:00')
-    .map(n => n.mac)
-    .sort()
-  if (macs.length > 0) return createHash('sha1').update(macs[0]).digest('hex').slice(0, 8)
-  if (!state.machineId) {
-    state.machineId = createHash('sha1').update(`${hostname()}|${HOME}|${Math.random()}`).digest('hex').slice(0, 8)
-    saveState()
-  }
-  return state.machineId
+  if (config.machineId) return String(config.machineId).trim()
+  return createHash('sha1').update(`${hostname()}|${HOME}|${process.platform}`).digest('hex').slice(0, 8)
 }
 
 const CONTROL_CHANNEL = config.controlChannel ?? 'claude-watchers'
@@ -1372,6 +1368,20 @@ async function setupControl() {
     }
     const recent = await controlChannel.messages.fetch({ limit: 50 })
     heartbeatMsg = recent.find(m => m.author.id === client.user.id && m.content.includes(`"id":"${MACHINE_ID}"`)) ?? null
+    // Clear out heartbeats nobody claims any more (a machine that changed id,
+    // or one that has been offline for a day), so the channel stays readable.
+    for (const m of recent.values()) {
+      if (m.author.id !== client.user.id || m.id === heartbeatMsg?.id) continue
+      const block = m.content.match(/```json\n([\s\S]*?)\n```/)
+      let ts = 0
+      let id = null
+      try {
+        const p = JSON.parse(block?.[1] ?? '{}')
+        ts = p.ts ?? 0
+        id = p.id ?? null
+      } catch {}
+      if (!id || Date.now() - ts > 24 * 60 * 60 * 1000) void m.delete().catch(() => {})
+    }
     await beat()
     setInterval(() => void beat(), 60_000).unref?.()
     log(`coordination on as ${MACHINE} (${MACHINE_ID}) in #${CONTROL_CHANNEL}`)

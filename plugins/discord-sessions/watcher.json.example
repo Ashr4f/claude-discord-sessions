@@ -5,6 +5,8 @@
   "//machine": "Label for this PC in the Discord control channel. Defaults to the hostname, purely cosmetic: identity comes from a MAC fingerprint, so two machines may share a name.",
   "machine": "desktop",
 
+  "//machineId": "Only needed if two machines share the same hostname AND the same user folder. By default the id is derived from hostname + home + platform.",
+
   "//controlChannel": "Channel the watchers use to see each other (created on first run). Default: claude-watchers.",
   "controlChannel": "claude-watchers",
 
