@@ -42,18 +42,24 @@ This is a fork of the official `discord` plugin for Claude Code (Apache-2.0, by 
 
 If you use the official `discord` plugin, disable it (`/plugin`) — running both doubles every connection.
 
-**4. Allow the plugin to deliver messages.** Claude Code only lets plugins on its default allowlist push inbound messages, and third-party plugins are not on it — without this step the bot can talk but never hears you. Add to `~/.claude/settings.json`:
+**4. Let the plugin hear you.** Claude Code only delivers inbound messages for plugins on its own allowlist, which Anthropic curates, and no third-party plugin is on it. Without this the bot posts but never receives. Two working options, pick one:
 
-```json
-{
-  "channelsEnabled": true,
-  "allowedChannelPlugins": [
-    { "marketplace": "claude-discord-sessions", "plugin": "discord-sessions" }
-  ]
-}
-```
+- **Personal plan:** start your sessions with the development flag and accept the warning screen once per session:
 
-Note: `allowedChannelPlugins` replaces the default allowlist. If you also use other channel plugins (telegram, etc.), list them here too.
+  ```
+  claude --dangerously-load-development-channels plugin:discord-sessions@claude-discord-sessions
+  ```
+
+- **Team or Enterprise:** an admin adds the plugin to the organization's managed settings, and no flag is needed afterwards:
+
+  ```json
+  { "channelsEnabled": true,
+    "allowedChannelPlugins": [ { "marketplace": "claude-discord-sessions", "plugin": "discord-sessions" } ] }
+  ```
+
+  `allowedChannelPlugins` replaces the default allowlist, so list any other channel plugins you use. It is a managed policy: putting it in your own `~/.claude/settings.json` on a personal plan does nothing (verified on 2.1.234, the debug log still says "not on the approved channels allowlist").
+
+Follow [anthropics/claude-code#82571](https://github.com/anthropics/claude-code/issues/82571) for a per-user consent path.
 
 **5. Save your bot token:** create `~/.claude/channels/discord/.env` containing:
 
