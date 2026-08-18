@@ -1206,6 +1206,8 @@ setInterval(() => {
 // hours later thinking the work went on. Detect that state, pick the work back
 // up a few times, and say it in the channel either way.
 const MAX_AUTO_RESUME = 3
+const RESUME_WINDOW_MS = 60 * 60 * 1000
+const RESUME_SPACING_MS = 5 * 60 * 1000
 
 function transcriptStall(s) {
   const p = transcriptPathFor(s)
@@ -1249,20 +1251,35 @@ setInterval(() => {
     if (Date.now() - lastWriteMs(s) < 60_000) continue
     const stall = transcriptStall(s)
     if (!stall) continue
-    if (s.resume?.at !== stall.at) s.resume = { at: stall.at, n: 0 }
-    if (s.resume.n >= MAX_AUTO_RESUME) continue
-    s.resume.n++
+    // The budget is per session over a window, not per error: an API outage
+    // hands out a new error timestamp every time, so counting per error let it
+    // retry forever (9 times in 23 minutes the first time this ran).
+    const now = Date.now()
+    s.resumes = (s.resumes ?? []).filter(t => now - t < RESUME_WINDOW_MS)
+    if (s.resumes.length >= MAX_AUTO_RESUME) {
+      if (!s.resumeGaveUp) {
+        s.resumeGaveUp = true
+        saveState()
+        void announce(
+          cid,
+          `⚠️ Still stopping on API errors (${stall.reason}). ${MAX_AUTO_RESUME} automatic retries used, I stop there. Send a message when you want to continue.`,
+        )
+      }
+      continue
+    }
+    // Space the retries out, hammering a 529 back to back changes nothing.
+    if (s.resumes.length > 0 && now - s.resumes[s.resumes.length - 1] < RESUME_SPACING_MS) continue
+    s.resumes.push(now)
+    s.resumeGaveUp = false
     saveState()
     writeCommandFile(cid, 'Your last turn stopped on an API error. Continue the work where it stopped, do not start over.', {
       username: 'watcher',
       id: allowFrom[0] ?? '0',
     })
-    log(`#${s.channelName}: stalled on "${stall.reason}", auto-resume ${s.resume.n}/${MAX_AUTO_RESUME}`)
+    log(`#${s.channelName}: stalled on "${stall.reason}", auto-resume ${s.resumes.length}/${MAX_AUTO_RESUME}`)
     void announce(
       cid,
-      s.resume.n < MAX_AUTO_RESUME
-        ? `⚠️ Stopped on an API error (${stall.reason}). Picking the work back up, try ${s.resume.n}/${MAX_AUTO_RESUME}.`
-        : `⚠️ Stopped on an API error (${stall.reason}) and it keeps failing. Last automatic retry (${s.resume.n}/${MAX_AUTO_RESUME}), after that send a message to continue.`,
+      `⚠️ Stopped on an API error (${stall.reason}). Picking the work back up, try ${s.resumes.length}/${MAX_AUTO_RESUME} of the hour.`,
     )
   }
 }, 60_000)
