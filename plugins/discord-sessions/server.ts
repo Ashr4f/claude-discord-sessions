@@ -342,6 +342,32 @@ async function bindSessionChannel(): Promise<void> {
 const LIVE_DIR = join(STATE_DIR, 'live')
 const LIVE_FILE = join(LIVE_DIR, `${process.pid}.json`)
 const SPOOL_DIR = join(STATE_DIR, 'pending')
+// LOCAL PATCH: a session waiting on an Allow click must not be reaped as idle.
+// The watcher only sees silence, so it killed sessions that were blocked on a
+// permission prompt: 30 minutes later the button answered a session that no
+// longer existed. This marker tells the watcher to leave it alone.
+const AWAIT_DIR = join(STATE_DIR, 'awaiting')
+
+function syncAwaitingMarker(): void {
+  if (!boundChannelId) return
+  const f = join(AWAIT_DIR, `${boundChannelId}.json`)
+  try {
+    if (pendingPermissions.size > 0) {
+      mkdirSync(AWAIT_DIR, { recursive: true })
+      writeFileSync(
+        f,
+        JSON.stringify({
+          pid: process.pid,
+          claudePid: ownerClaudePid,
+          pending: pendingPermissions.size,
+          since: new Date().toISOString(),
+        }),
+      )
+    } else {
+      rmSync(f, { force: true })
+    }
+  } catch {}
+}
 let lastRegisteredKey: string | null = null
 
 function writeLiveRegistry(): void {
@@ -1234,6 +1260,7 @@ function retireStalePermissionPrompts(): void {
     // enough that the session clearly moved on.
     if (Date.now() - ref.postedAt < 15_000) continue
     pendingPermissions.delete(id)
+    syncAwaitingMarker()
     void (async () => {
       try {
         const ch = await fetchTextChannel(ref.channelId)
@@ -1322,6 +1349,7 @@ mcp.setNotificationHandler(
   async ({ params }) => {
     const { request_id, tool_name, description, input_preview } = params
     pendingPermissions.set(request_id, { tool_name, description, input_preview })
+    syncAwaitingMarker()
     const access = loadAccess()
     const text = `🔐 Permission: ${tool_name}`
     const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -1836,6 +1864,9 @@ function shutdown(): void {
   try {
     rmSync(LIVE_FILE)
   } catch {}
+  try {
+    if (boundChannelId) rmSync(join(AWAIT_DIR, `${boundChannelId}.json`), { force: true })
+  } catch {}
   setTimeout(() => process.exit(0), 2000)
   void Promise.resolve(client.destroy()).finally(() => process.exit(0))
 }
@@ -2035,6 +2066,7 @@ client.on('interactionCreate', async (interaction: Interaction) => {
     params: { request_id, behavior },
   })
   pendingPermissions.delete(request_id)
+  syncAwaitingMarker()
   const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
   // Replace buttons with the outcome so the same request can't be answered
   // twice and the chat history shows what was chosen.

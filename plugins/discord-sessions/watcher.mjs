@@ -44,6 +44,7 @@ import { execFileSync, spawn } from 'child_process'
 const HOME = homedir()
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(HOME, '.claude', 'channels', 'discord')
 const LIVE_DIR = join(STATE_DIR, 'live')
+const AWAIT_DIR = join(STATE_DIR, 'awaiting')
 const SPOOL_DIR = join(STATE_DIR, 'pending')
 const PROJECTS_DIR = join(HOME, '.claude', 'projects')
 const CONFIG_FILE = join(STATE_DIR, 'watcher.json')
@@ -856,16 +857,21 @@ async function statusText() {
     rows.push('', await usageText())
   } catch {}
   rows.push('', '**Sessions**')
-  const spawnedRows = Object.values(state.spawned)
-    .filter(s => pidAlive(s.pid))
-    .map(s => {
+  const spawnedRows = Object.entries(state.spawned)
+    .filter(([, s]) => pidAlive(s.pid))
+    .map(([cid, s]) => {
       // Same activity rule as the reaper: transcript writes count too, so a
       // session that is working shows a full timer instead of a shrinking one.
       const active = Math.max(s.lastActivity, lastWriteMs(s))
       const left = Math.max(0, Math.round((active + idleMs - Date.now()) / 60000))
       const age = Math.max(0, Math.round((Date.now() - s.spawnedAt) / 60000))
-      const working = Date.now() - lastWriteMs(s) < 60_000 ? ', working right now' : ''
-      return `#${s.channelName} — \`${s.cwd}\` — background, up ${age} min${working}, shuts down after ~${left} more min of silence`
+      const working = awaitingSince(cid)
+        ? ', waiting on your Allow'
+        : Date.now() - lastWriteMs(s) < 60_000
+          ? ', working right now'
+          : ''
+      const tail = awaitingSince(cid) ? 'it stays up until you answer' : `shuts down after ~${left} more min of silence`
+      return `#${s.channelName} — \`${s.cwd}\` — background, up ${age} min${working}, ${tail}`
     })
   const terminals = listLive().filter(r => r.includes('(terminal)'))
   rows.push(...(spawnedRows.length > 0 ? spawnedRows : ['No background sessions.']), ...terminals)
@@ -1178,6 +1184,18 @@ function listLive() {
   return rows
 }
 
+// A permission prompt still waiting for a click, written by the session's
+// server. Returns when it started, or null.
+const AWAIT_MAX_MS = 6 * 60 * 60 * 1000
+
+function awaitingSince(channelId) {
+  const e = readJson(join(AWAIT_DIR, `${channelId}.json`), null)
+  if (!e?.pending) return null
+  if (e.pid && !pidAlive(e.pid)) return null
+  const t = Date.parse(e.since ?? '')
+  return Number.isFinite(t) ? t : Date.now()
+}
+
 // ── idle reaper ─────────────────────────────────────────────────────────────
 // Discord traffic is not the only sign of life: a session can work for an hour
 // on one message without posting anything. Claude Code appends to the session
@@ -1242,6 +1260,12 @@ setInterval(() => {
       s.lastActivity = wrote
       saveState()
     }
+    // A session blocked on a permission prompt is not idle, it is waiting on
+    // you. Killing it made the Allow button answer a session that no longer
+    // existed. Held for AWAIT_MAX_MS, after that an abandoned prompt is not a
+    // reason to keep a session forever.
+    const waiting = awaitingSince(cid)
+    if (waiting && Date.now() - waiting < AWAIT_MAX_MS) continue
     if (Date.now() - s.lastActivity > idleMs) {
       log(`#${s.channelName}: idle ${config.idleMinutes}min, shutting down pid ${s.pid}`)
       killTree(s.pid)
