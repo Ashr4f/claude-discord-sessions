@@ -1005,7 +1005,11 @@ async function fetchUsage() {
   const r = await fetch('https://api.anthropic.com/api/oauth/usage', {
     headers: { Authorization: `Bearer ${cred.accessToken}`, 'anthropic-beta': 'oauth-2025-04-20' },
   })
-  if (r.status === 401) throw new Error('Claude token expired — it refreshes automatically on any Claude activity, try again in a minute')
+  if (r.status === 401) {
+    const err = new Error('Claude token expired — it refreshes automatically on any Claude activity, try again in a minute')
+    err.authExpired = true
+    throw err
+  }
   if (!r.ok) throw new Error(`usage endpoint returned ${r.status}`)
   return r.json()
 }
@@ -1063,6 +1067,52 @@ function costText() {
   return [`**Equivalent API cost** — $${total.toFixed(2)} total, all projects since install`, top.join(' · ')].join('\n')
 }
 
+// A background session cannot answer /login: the OAuth flow needs a terminal
+// and a browser. So when the credentials really are gone, say it in the
+// channel instead of letting every wake die on an auth error. Transient 401s
+// happen (the token refreshes on any Claude activity), hence the streak.
+const AUTH_FAIL_STREAK = 3
+let authFails = 0
+let authWarned = false
+let cachedFallbackId = null
+
+async function fallbackChannelId() {
+  if (cachedFallbackId) return cachedFallbackId
+  if (!routing.guildId) return null
+  const name = routing.fallback ?? 'general'
+  try {
+    const guild = await client.guilds.fetch(routing.guildId)
+    const chans = await guild.channels.fetch()
+    cachedFallbackId = chans.find(c => c?.name === name && typeof c.send === 'function')?.id ?? null
+  } catch {
+    return null
+  }
+  return cachedFallbackId
+}
+
+async function noteAuthFailure() {
+  authFails++
+  if (authWarned || authFails < AUTH_FAIL_STREAK) return
+  authWarned = true
+  client.user?.setPresence({
+    activities: [{ type: 4, name: 'usage', state: 'login expired, run /login on the PC' }],
+    status: 'idle',
+  })
+  const cid = await fallbackChannelId()
+  if (cid) {
+    void announce(
+      cid,
+      `⚠️ Claude Code is logged out on \`${MACHINE}\`. I can post here but no session can think: \`/login\` needs a terminal and a browser, a background session cannot do it. Run \`claude\` on that PC and \`/login\`, everything resumes by itself after that.`,
+    )
+  }
+  log('auth expired, warned in the fallback channel')
+}
+
+function noteAuthOk() {
+  authFails = 0
+  authWarned = false
+}
+
 // Bot presence shows the numbers all the time, refreshed every 10 min.
 let lastPresence = ''
 async function refreshPresence() {
@@ -1075,6 +1125,7 @@ async function refreshPresence() {
       if (l.kind === 'weekly_scoped' && l.scope?.model?.display_name) parts.push(`${l.scope.model.display_name} ${l.percent}%`)
     }
     const r5 = resetsIn(u.five_hour?.resets_at).replace('resets in ', '↻')
+    noteAuthOk()
     const text = parts.join(' • ') + (r5 ? ` (${r5})` : '')
     if (!text || text === lastPresence) return
     lastPresence = text
@@ -1082,6 +1133,7 @@ async function refreshPresence() {
     log(`presence updated: ${text}`)
   } catch (err) {
     log(`presence refresh failed: ${err.message ?? err}`)
+    if (err?.authExpired) void noteAuthFailure()
   }
 }
 setInterval(() => void refreshPresence(), 10 * 60 * 1000).unref?.()
