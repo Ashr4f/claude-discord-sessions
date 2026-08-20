@@ -863,11 +863,41 @@ function mdTablesToAscii(text: string, forFile = false): string {
   return out.join('\n')
 }
 
+// LOCAL PATCH: after we post something, typing follows the transcript instead
+// of stopping dead. Stopping on any post we send was wrong for interim
+// messages: say "on it", spawn an agent, and the channel showed nothing for
+// ten minutes. Claude Code appends to the transcript on every step, subagent
+// steps included, so a transcript that is still growing means still working.
+// Only the mirror's final Stop-marked post ends the indicator outright.
+const typingSuspended = new Set<string>()
+const TRANSCRIPT_FRESH_MS = 15_000
+
+function transcriptMtime(): number {
+  sessionInfo ??= findSessionInfo()
+  const p = sessionInfo?.transcriptPath
+  if (!p) return 0
+  try {
+    return statSync(p).mtimeMs
+  } catch {
+    return 0
+  }
+}
+
 function stopTyping(channelId: string | null): void {
   if (!channelId) return
   const t = typingTimers.get(channelId)
   if (t) clearInterval(t)
   typingTimers.delete(channelId)
+  typingSuspended.delete(channelId)
+}
+
+// Our own post: keep the loop alive but only type while work is visibly going
+// on. No transcript (env-bound session before its first write) means fall back
+// to the old behaviour and stop.
+function suspendTyping(channelId: string | null): void {
+  if (!channelId) return
+  if (!typingTimers.has(channelId) || transcriptMtime() === 0) return stopTyping(channelId)
+  typingSuspended.add(channelId)
 }
 
 function startTyping(ch: unknown, channelId: string): void {
@@ -876,7 +906,16 @@ function startTyping(ch: unknown, channelId: string): void {
   void (ch as any).sendTyping().catch(() => {})
   const started = Date.now()
   const timer = setInterval(() => {
-    if (Date.now() - started > TYPING_MAX_MS) return stopTyping(channelId)
+    const suspended = typingSuspended.has(channelId)
+    // Before we post anything the cap is the only hang guard. Once suspended,
+    // transcript freshness is a better one, so the cap steps aside and only a
+    // long silence ends it.
+    if (!suspended && Date.now() - started > TYPING_MAX_MS) return stopTyping(channelId)
+    if (suspended) {
+      const quiet = Date.now() - transcriptMtime()
+      if (quiet > 10 * 60 * 1000) return stopTyping(channelId)
+      if (quiet > TRANSCRIPT_FRESH_MS) return
+    }
     void (ch as any).sendTyping().catch(() => {})
   }, 8000)
   ;(timer as any).unref?.()
@@ -1561,7 +1600,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           sentIds.push(sent.id)
         }
 
-        stopTyping(chat_id)
+        suspendTyping(chat_id)
         const result =
           sentIds.length === 1
             ? `sent (id: ${sentIds[0]})`
@@ -1705,14 +1744,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const ch = await fetchAllowedChannel(args.chat_id as string)
         const msg = await ch.messages.fetch(args.message_id as string)
         await msg.react(args.emoji as string)
-        stopTyping(args.chat_id as string)
+        suspendTyping(args.chat_id as string)
         return { content: [{ type: 'text', text: 'reacted' }] }
       }
       case 'edit_message': {
         const ch = await fetchAllowedChannel(args.chat_id as string)
         const msg = await ch.messages.fetch(args.message_id as string)
         const edited = await msg.edit(args.text as string)
-        stopTyping(args.chat_id as string)
+        suspendTyping(args.chat_id as string)
         return { content: [{ type: 'text', text: `edited (id: ${edited.id})` }] }
       }
       case 'download_attachment': {
@@ -1974,7 +2013,8 @@ client.on('messageCreate', msg => {
   // replies) and from other sessions' servers — those must not stop it,
   // Claude here is still working.
   if (msg.author.id === client.user?.id) {
-    if (recentSentIds.has(msg.id) || msg.content.includes('⁣')) stopTyping(msg.channelId)
+    if (msg.content.includes('⁣')) stopTyping(msg.channelId)
+    else if (recentSentIds.has(msg.id)) suspendTyping(msg.channelId)
     return
   }
   if (msg.author.bot) return

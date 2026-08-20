@@ -1208,6 +1208,8 @@ setInterval(() => {
 const MAX_AUTO_RESUME = 3
 const RESUME_WINDOW_MS = 60 * 60 * 1000
 const RESUME_SPACING_MS = 5 * 60 * 1000
+// A woken session that has not bound after this long is stuck, not slow.
+const BOOT_GRACE_MS = 4 * 60 * 1000
 
 function transcriptStall(s) {
   const p = transcriptPathFor(s)
@@ -1558,11 +1560,23 @@ client.on('messageCreate', async msg => {
     // the 90s waking guard. As long as its pid is alive, never wake a second
     // one: spool the message, the booting session picks it up on bind (the
     // server re-reads the spool on every rebind tick).
+    // A spawned session that never binds used to keep this guard forever, so
+    // messages piled up in the spool for 16 minutes with only the hourglass to
+    // show for it. Past BOOT_GRACE_MS with no live registry entry, the process
+    // is stuck: kill it and wake a fresh one.
     const booting = state.spawned[channelId]
     if (booting && pidAlive(booting.pid)) {
-      spoolMessage(channelId, msg)
-      log(`#${channelName}: session pid ${booting.pid} still booting, spooled ${msg.id} instead of double-waking`)
-      return
+      const bootingFor = Date.now() - (booting.spawnedAt ?? 0)
+      if (bootingFor < BOOT_GRACE_MS) {
+        spoolMessage(channelId, msg)
+        log(`#${channelName}: session pid ${booting.pid} still booting, spooled ${msg.id} instead of double-waking`)
+        return
+      }
+      log(`#${channelName}: pid ${booting.pid} never bound in ${Math.round(bootingFor / 60000)} min, killing it and waking a fresh one`)
+      await killTree(booting.pid)
+      delete state.spawned[channelId]
+      saveState()
+      void announce(channelId, '⚠️ The session I woke never came up. Killing it and starting another one.')
     }
 
     if (!(await ownsWake(channelId, channelName))) {
