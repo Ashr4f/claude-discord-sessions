@@ -869,6 +869,36 @@ function mdTablesToAscii(text: string, forFile = false): string {
 // ten minutes. Claude Code appends to the transcript on every step, subagent
 // steps included, so a transcript that is still growing means still working.
 // Only the mirror's final Stop-marked post ends the indicator outright.
+// Inbound messages waiting for an answer, per channel, oldest first. Filled on
+// delivery, drained one per outgoing post so each message gets quoted once.
+const pendingQuotes = new Map<string, string[]>()
+const PENDING_QUOTES_CAP = 10
+
+function noteQuote(channelId: string, messageId: string): void {
+  // Synthetic ids (spool replays, watcher command injections) are not real
+  // Discord messages, quoting them would silently drop the reference.
+  if (!/^\d{17,20}$/.test(messageId)) return
+  const q = pendingQuotes.get(channelId) ?? []
+  q.push(messageId)
+  while (q.length > PENDING_QUOTES_CAP) q.shift()
+  pendingQuotes.set(channelId, q)
+}
+
+function takeQuote(channelId: string): string | undefined {
+  const q = pendingQuotes.get(channelId)
+  const id = q?.shift()
+  if (q && q.length === 0) pendingQuotes.delete(channelId)
+  return id
+}
+
+function dropQuote(channelId: string, messageId: string): void {
+  const q = pendingQuotes.get(channelId)
+  if (!q) return
+  const i = q.indexOf(messageId)
+  if (i >= 0) q.splice(i, 1)
+  if (q.length === 0) pendingQuotes.delete(channelId)
+}
+
 const typingSuspended = new Set<string>()
 const TRANSCRIPT_FRESH_MS = 15_000
 
@@ -1169,7 +1199,7 @@ const mcp = new Server(
       '',
       'Strict surface separation, one conversation lives on one surface. When the turn STARTED from a Discord message: put everything in the reply tool call, end with the literal transcript text "Replied on Discord." and nothing more. When the turn started from the terminal: answer only in the terminal and send NOTHING to Discord (no reply, no react) — permission prompts are the only exception and are relayed automatically. Never refer to the user in the third person; the sender and the terminal user are the same person.',
       '',
-      'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses. When the user quote-replies to one of your messages, the tag carries in_reply_to_id, in_reply_to_user and in_reply_to (the quoted text) — read it, it is the subject of what they just wrote.',
+      'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. Quote-replies are automatic: leave reply_to out and each post you send quotes the oldest message of theirs that has not been answered yet, so when they send "do X" then "and Y too", your first post answers the first and a second post answers the second. Pass reply_to yourself only to quote some other, older message on purpose. When the user quote-replies to one of your messages, the tag carries in_reply_to_id, in_reply_to_user and in_reply_to (the quoted text) — read it, it is the subject of what they just wrote.',
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
@@ -1258,6 +1288,7 @@ function deliverAnswer(content: string, chatId: string, messageId: string, user:
     } catch {}
   })()
   lastChatId = chatId
+  noteQuote(chatId, messageId)
   void mcp.notification({
     method: 'notifications/claude/channel',
     params: {
@@ -1514,7 +1545,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
         const text = mdTablesToAscii(args.text as string)
-        const reply_to = args.reply_to as string | undefined
+        // LOCAL PATCH: quote-reply the message being answered, automatically.
+        // Several messages often arrive in one turn ("do X", then "and Y too"),
+        // and a bare answer leaves the user guessing which one it covers. Each
+        // post takes the oldest message not yet quoted, so consecutive posts
+        // walk the queue and every message visibly gets an answer.
+        const reply_to = (args.reply_to as string | undefined) ?? takeQuote(chat_id)
+        if (args.reply_to) dropQuote(chat_id, args.reply_to as string)
         const files = (args.files as string[] | undefined) ?? []
 
         const ch = await fetchAllowedChannel(chat_id)
@@ -2110,6 +2147,7 @@ async function handleInbound(msg: Message): Promise<void> {
 
   // LOCAL PATCH: typing indicator kept alive while the session works.
   startTyping(msg.channel, msg.channelId)
+  noteQuote(msg.channelId, msg.id)
   lastChatId = msg.channelId
   lastChatParentId = msg.channel.isThread() ? (msg.channel.parentId ?? null) : null
 

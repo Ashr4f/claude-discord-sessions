@@ -13,6 +13,7 @@ This is a fork of the official `discord` plugin for Claude Code (Apache-2.0, by 
 - **Permission prompts in the channel** with Allow / Deny / See more buttons (instead of DM spam).
 - **Readable tables.** Markdown tables ship as a `message.txt` attachment drawn in box characters, cells word-wrapped and capped at 62 columns so they stay readable on a phone.
 - **Honest typing indicator.** The bot shows as typing for as long as the session is actually working, including while an agent or subagent runs after an interim message.
+- **Every message gets an answer.** Each reply quotes the message it answers, and consecutive posts walk through the messages you sent, so nothing looks skipped when you fire off two in a row.
 - **Quote-reply context.** Reply to one of the bot's messages and the session sees which message you answered, with its text.
 - **Clickable questions.** Claude asks multiple-choice questions with colored buttons, or a popup form with dropdowns and a free-text field for multi-question cases. You can always type a custom answer instead.
 - **Manual rebinding.** Tell a session "talk in #x" (the `bind_channel` tool), or set `DISCORD_CHANNEL=x` when launching.
