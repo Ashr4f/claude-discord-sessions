@@ -1074,13 +1074,24 @@ function costText() {
 }
 
 // A background session cannot answer /login: the OAuth flow needs a terminal
-// and a browser. So when the credentials really are gone, say it in the
-// channel instead of letting every wake die on an auth error. Transient 401s
-// happen (the token refreshes on any Claude activity), hence the streak.
-const AUTH_FAIL_STREAK = 3
-let authFails = 0
-let authWarned = false
+// and a browser. So when the login is really gone, say it in the channel
+// instead of letting every wake die on an auth error.
+//
+// A 401 from the usage endpoint is NOT that signal: the access token goes
+// stale on its own and Claude Code refreshes it on any activity, so a quiet
+// night produces hours of 401s with a perfectly valid login. Counting those
+// sent three false alarms in two days. The credentials file is the signal:
+// the login is gone only once the refresh token itself has expired.
+const AUTH_REWARN_MS = 12 * 60 * 60 * 1000
 let cachedFallbackId = null
+
+function loginGone() {
+  const c = readJson(join(HOME, '.claude', '.credentials.json'), null)?.claudeAiOauth
+  if (!c?.refreshToken) return 'no credentials on this machine'
+  const until = Number(c.refreshTokenExpiresAt ?? 0)
+  if (until && until < Date.now()) return `refresh token expired ${new Date(until).toISOString()}`
+  return null
+}
 
 async function fallbackChannelId() {
   if (cachedFallbackId) return cachedFallbackId
@@ -1097,9 +1108,12 @@ async function fallbackChannelId() {
 }
 
 async function noteAuthFailure() {
-  authFails++
-  if (authWarned || authFails < AUTH_FAIL_STREAK) return
-  authWarned = true
+  const gone = loginGone()
+  if (!gone) return
+  // Persisted so a watcher restart does not start the reminders over.
+  if (state.authWarnedAt && Date.now() - state.authWarnedAt < AUTH_REWARN_MS) return
+  state.authWarnedAt = Date.now()
+  saveState()
   client.user?.setPresence({
     activities: [{ type: 4, name: 'usage', state: 'login expired, run /login on the PC' }],
     status: 'idle',
@@ -1108,15 +1122,20 @@ async function noteAuthFailure() {
   if (cid) {
     void announce(
       cid,
-      `⚠️ Claude Code is logged out on \`${MACHINE}\`. I can post here but no session can think: \`/login\` needs a terminal and a browser, a background session cannot do it. Run \`claude\` on that PC and \`/login\`, everything resumes by itself after that.`,
+      `⚠️ Claude Code is logged out on \`${MACHINE}\` (${gone}). I can post here but no session can think: \`/login\` needs a terminal and a browser, a background session cannot do it. Run \`claude\` on that PC and \`/login\`, everything resumes by itself after that.`,
     )
   }
-  log('auth expired, warned in the fallback channel')
+  log(`login gone (${gone}), warned in the fallback channel`)
 }
 
+// Back to normal: drop the warning and force the next presence write, or the
+// status stays stuck on "login expired" because the text never changed.
 function noteAuthOk() {
-  authFails = 0
-  authWarned = false
+  if (!state.authWarnedAt) return
+  delete state.authWarnedAt
+  saveState()
+  lastPresence = ''
+  log('login is valid again, clearing the warning')
 }
 
 // Bot presence shows the numbers all the time, refreshed every 10 min.
