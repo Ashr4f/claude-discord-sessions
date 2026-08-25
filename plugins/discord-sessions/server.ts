@@ -1314,7 +1314,9 @@ function deliverAnswer(content: string, chatId: string, messageId: string, user:
       lastChatParentId = (ch as any).isThread?.() ? ((ch as any).parentId ?? null) : null
     } catch {}
   })()
-  lastChatId = chatId
+  // Never let an injection aimed at the parent channel (watcher commands are
+  // keyed by the bound channel) move the conversation out of an open thread.
+  if (!(lastChatParentId && chatId === lastChatParentId)) lastChatId = chatId
   noteQuote(chatId, messageId)
   void mcp.notification({
     method: 'notifications/claude/channel',
@@ -1558,19 +1560,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       case 'reply': {
         let chat_id = args.chat_id as string
         // LOCAL PATCH: snap the reply to where the user actually spoke last.
-        // The model sometimes reuses a stale chat_id from earlier context —
-        // typically the parent channel after the user opened a thread. When
-        // the given id and lastChatId are parent/thread of each other, the
-        // conversation channel (lastChatId) wins.
-        if (lastChatId && chat_id !== lastChatId) {
-          if (chat_id === lastChatParentId) {
-            chat_id = lastChatId
-          } else {
-            try {
-              const given = await client.channels.fetch(chat_id)
-              if (given?.isThread() && given.parentId === lastChatId) chat_id = lastChatId
-            } catch {}
-          }
+        // The model sometimes reuses a stale chat_id from earlier context,
+        // typically the parent channel after the user opened a thread. The
+        // snap only ever goes parent -> thread. The reverse used to be here
+        // too and it dragged correct thread answers back into the parent
+        // whenever something (a watcher injection, a form answer) had set
+        // lastChatId to the parent in between.
+        if (lastChatId && chat_id !== lastChatId && chat_id === lastChatParentId) {
+          chat_id = lastChatId
         }
         const text = mdTablesToAscii(args.text as string)
         // LOCAL PATCH: quote-reply the message being answered, automatically.
