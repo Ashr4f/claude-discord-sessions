@@ -897,32 +897,47 @@ function mdTablesToAscii(text: string, forFile = false): string {
 // Only the mirror's final Stop-marked post ends the indicator outright.
 // Inbound messages waiting for an answer, per channel, oldest first. Filled on
 // delivery, drained one per outgoing post so each message gets quoted once.
-const pendingQuotes = new Map<string, string[]>()
+const pendingQuotes = new Map<string, { id: string; at: number }[]>()
 const PENDING_QUOTES_CAP = 10
+// A message nobody quoted within this long is not worth quoting later: it
+// would put the answer to the current question under an old message.
+const QUOTE_TTL_MS = 5 * 60 * 1000
 
 function noteQuote(channelId: string, messageId: string): void {
   // Synthetic ids (spool replays, watcher command injections) are not real
   // Discord messages, quoting them would silently drop the reference.
   if (!/^\d{17,20}$/.test(messageId)) return
   const q = pendingQuotes.get(channelId) ?? []
-  q.push(messageId)
+  q.push({ id: messageId, at: Date.now() })
   while (q.length > PENDING_QUOTES_CAP) q.shift()
   pendingQuotes.set(channelId, q)
 }
 
 function takeQuote(channelId: string): string | undefined {
   const q = pendingQuotes.get(channelId)
-  const id = q?.shift()
-  if (q && q.length === 0) pendingQuotes.delete(channelId)
-  return id
+  if (!q) return undefined
+  // Drop anything stale first, otherwise the queue lags a message behind for
+  // the rest of the session: answer three messages with two posts once and
+  // every later answer quotes the previous question.
+  const cutoff = Date.now() - QUOTE_TTL_MS
+  while (q.length > 0 && q[0].at < cutoff) q.shift()
+  const next = q.shift()
+  if (q.length === 0) pendingQuotes.delete(channelId)
+  return next?.id
 }
 
 function dropQuote(channelId: string, messageId: string): void {
   const q = pendingQuotes.get(channelId)
   if (!q) return
-  const i = q.indexOf(messageId)
+  const i = q.findIndex(e => e.id === messageId)
   if (i >= 0) q.splice(i, 1)
   if (q.length === 0) pendingQuotes.delete(channelId)
+}
+
+// End of turn (the mirror's marked final post): whatever was not quoted by
+// then is answered, it must not leak into the next turn.
+function clearQuotes(channelId: string): void {
+  pendingQuotes.delete(channelId)
 }
 
 const typingSuspended = new Set<string>()
@@ -1225,7 +1240,7 @@ const mcp = new Server(
       '',
       'Strict surface separation, one conversation lives on one surface. When the turn STARTED from a Discord message: put everything in the reply tool call, end with the literal transcript text "Replied on Discord." and nothing more. When the turn started from the terminal: answer only in the terminal and send NOTHING to Discord (no reply, no react) — permission prompts are the only exception and are relayed automatically. Never refer to the user in the third person; the sender and the terminal user are the same person.',
       '',
-      'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. Quote-replies are automatic: leave reply_to out and each post you send quotes the oldest message of theirs that has not been answered yet, so when they send "do X" then "and Y too", your first post answers the first and a second post answers the second. Pass reply_to yourself only to quote some other, older message on purpose. When the user quote-replies to one of your messages, the tag carries in_reply_to_id, in_reply_to_user and in_reply_to (the quoted text) — read it, it is the subject of what they just wrote.',
+      'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. Quote-reply the message you are actually answering: pass reply_to with that message_id, even when it is not the most recent one. Answering a commit-it from three messages back quotes THAT message, not the latest. If you leave reply_to out, the oldest of their messages not yet quoted is used as a fallback, so a burst of messages still each get an answer.',
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
@@ -2079,7 +2094,10 @@ client.on('messageCreate', msg => {
   // replies) and from other sessions' servers — those must not stop it,
   // Claude here is still working.
   if (msg.author.id === client.user?.id) {
-    if (msg.content.includes('⁣')) stopTyping(msg.channelId)
+    if (msg.content.includes('⁣')) {
+      stopTyping(msg.channelId)
+      clearQuotes(msg.channelId)
+    }
     else if (recentSentIds.has(msg.id)) suspendTyping(msg.channelId)
     return
   }
