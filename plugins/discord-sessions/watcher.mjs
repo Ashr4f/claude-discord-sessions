@@ -45,6 +45,7 @@ const HOME = homedir()
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(HOME, '.claude', 'channels', 'discord')
 const LIVE_DIR = join(STATE_DIR, 'live')
 const AWAIT_DIR = join(STATE_DIR, 'awaiting')
+const REQ_DIR = join(STATE_DIR, 'requests')
 const SPOOL_DIR = join(STATE_DIR, 'pending')
 const PROJECTS_DIR = join(HOME, '.claude', 'projects')
 const CONFIG_FILE = join(STATE_DIR, 'watcher.json')
@@ -115,7 +116,8 @@ function pluginDir() {
   return join(base, versions[0])
 }
 const requirePlugin = createRequire(join(pluginDir(), 'noop.js'))
-const { Client, GatewayIntentBits, Partials, ActionRowBuilder, StringSelectMenuBuilder } = requirePlugin('discord.js')
+const { Client, GatewayIntentBits, Partials, ActionRowBuilder, StringSelectMenuBuilder, ButtonBuilder, ButtonStyle } =
+  requirePlugin('discord.js')
 
 // ── claude executable ───────────────────────────────────────────────────────
 const IS_WIN = process.platform === 'win32'
@@ -326,9 +328,15 @@ function canonPath(p) {
 function isTrusted(dir) {
   try {
     const j = JSON.parse(readFileSync(join(HOME, '.claude.json'), 'utf8'))
-    const want = dir.replace(/\\/g, '/').toLowerCase()
+    const norm = x => x.replace(/\\/g, '/').toLowerCase().replace(/\/+$/, '')
+    const want = norm(dir)
     for (const [k, v] of Object.entries(j.projects ?? {})) {
-      if (k.replace(/\\/g, '/').toLowerCase() === want && v?.hasTrustDialogAccepted) return true
+      if (!v?.hasTrustDialogAccepted) continue
+      // A trusted folder covers everything under it: Claude Code never asks
+      // again inside a trusted parent, so it never records the child either,
+      // and the watcher refused to spawn there.
+      const trusted = norm(k)
+      if (want === trusted || want.startsWith(trusted + '/')) return true
     }
     return false
   } catch {
@@ -349,10 +357,11 @@ const CLAUDE_ARGS = ['--channels', 'plugin:discord@claude-plugins-official']
 // stays hidden — verified working. A direct bun spawn (detached+windowsHide)
 // gives no console at all and the TUI dies instantly; bun's execFileSync
 // throws spurious ETIMEDOUT — hence async spawn of a PowerShell middleman.
-function spawnClaudeWindows(cwd, channelName, resumeId, model) {
+function spawnClaudeWindows(cwd, channelName, resumeId, model, effort) {
   const args = CLAUDE_ARGS.map(psQuote)
   if (resumeId) args.push("'--resume'", psQuote(resumeId))
   if (model) args.push("'--model'", psQuote(model))
+  if (effort) args.push("'--effort'", psQuote(effort))
   const script =
     `$env:DISCORD_CHANNEL=${psQuote(channelName)}; $env:DISCORD_WAKE='1'; ` +
     `$p = Start-Process -FilePath ${psQuote(CLAUDE_EXE)} -ArgumentList @(${args.join(', ')}) ` +
@@ -388,10 +397,11 @@ function spawnClaudeWindows(cwd, channelName, resumeId, model) {
 // Linux/macOS: the TUI needs a pty; `script` allocates one without any native
 // dependency. Detached so the whole tree lives in its own process group and
 // killTree can take it down with kill(-pid).
-function spawnClaudePosix(cwd, channelName, resumeId, model) {
+function spawnClaudePosix(cwd, channelName, resumeId, model, effort) {
   const args = [...CLAUDE_ARGS]
   if (resumeId) args.push('--resume', resumeId)
   if (model) args.push('--model', model)
+  if (effort) args.push('--effort', effort)
   const env = { ...process.env, DISCORD_CHANNEL: channelName, DISCORD_WAKE: '1' }
   const shQuote = s => `'${String(s).replace(/'/g, "'\\''")}'`
   const child =
@@ -408,10 +418,10 @@ function spawnClaudePosix(cwd, channelName, resumeId, model) {
   return Promise.resolve(child.pid)
 }
 
-function spawnClaude(cwd, channelName, resumeId, model) {
+function spawnClaude(cwd, channelName, resumeId, model, effort) {
   return IS_WIN
-    ? spawnClaudeWindows(cwd, channelName, resumeId, model)
-    : spawnClaudePosix(cwd, channelName, resumeId, model)
+    ? spawnClaudeWindows(cwd, channelName, resumeId, model, effort)
+    : spawnClaudePosix(cwd, channelName, resumeId, model, effort)
 }
 
 // Async spawn, not execFileSync — bun's sync exec throws spurious ETIMEDOUT
@@ -528,7 +538,7 @@ async function wake(channelId, channelName, msg) {
 
   let pid
   try {
-    pid = await spawnClaude(cwd, channelName, resumeId, modelForWake(channelId, channelName))
+    pid = await spawnClaude(cwd, channelName, resumeId, modelForWake(channelId, channelName), state.effortOverrides?.[channelId])
   } catch (err) {
     log(`#${channelName}: spawn failed: ${err}`)
     removeHourglass(msg)
@@ -561,6 +571,8 @@ const HELP_TEXT = [
   '`/restart` — restart background session(s) (`all` or one channel)',
   '`/open` / `/hide` — show a background session\'s live terminal on the PC screen / tuck it away',
   '`/model` — show this channel\'s model, or switch it (applies live to a background session)',
+  '`/effort` — show or switch this channel effort level (low, medium, high, xhigh)',
+  '`/panel` — post the button panel: status, sessions, usage, terminal, plan, continue, restart, stop',
   '`/rename-bot` — rename the bot in this server',
   '`/update` — update Claude Code itself',
   '`/status` — watcher uptime, Claude version, idle timers',
@@ -612,7 +624,7 @@ async function restartOne(cid, s) {
   }
   indexSessions()
   const sess = findSessionByName(s.channelName)
-  const pid = await spawnClaude(sess?.cwd ?? s.cwd, s.channelName, sess?.sessionId ?? null, modelForWake(cid, s.channelName))
+  const pid = await spawnClaude(sess?.cwd ?? s.cwd, s.channelName, sess?.sessionId ?? null, modelForWake(cid, s.channelName), state.effortOverrides?.[cid])
   state.spawned[cid] = { ...s, pid, spawnedAt: Date.now(), lastActivity: Date.now() }
   saveState()
 }
@@ -831,7 +843,7 @@ async function spawnForChannel(channelId, channelName) {
   const sess = findSessionByName(channelName)
   const cwd = canonPath(sess?.cwd ?? config.defaultDir ?? HOME)
   if (!isTrusted(cwd)) return { ok: false, cwd }
-  const pid = await spawnClaude(cwd, channelName, sess?.sessionId ?? null, modelForWake(channelId, channelName))
+  const pid = await spawnClaude(cwd, channelName, sess?.sessionId ?? null, modelForWake(channelId, channelName), state.effortOverrides?.[channelId])
   state.spawned[channelId] = {
     pid,
     channelName,
@@ -968,6 +980,115 @@ async function modelText(channelName, channelId, choice) {
     }
   }
   return `Model for #${channelName}: ${target ? `\`${target}\`` : 'account default'}. ${note} Other channels are untouched.`
+}
+
+// Effort level per channel, same shape as the model override. ultracode is
+// session only (xhigh plus dynamic workflows), so it is not offered here.
+const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh']
+
+async function effortText(channelName, channelId, choice) {
+  state.effortOverrides = state.effortOverrides ?? {}
+  if (!choice) {
+    const pin = state.effortOverrides[channelId]
+    return [
+      `#${channelName}:`,
+      `Pinned here: ${pin ? `\`${pin}\`` : 'nothing, the account default applies'}`,
+      `Levels: ${EFFORT_LEVELS.join(', ')}, or default to unpin.`,
+    ].join('\n')
+  }
+  if (choice === 'default') delete state.effortOverrides[channelId]
+  else if (EFFORT_LEVELS.includes(choice)) state.effortOverrides[channelId] = choice
+  else return `Unknown level. Pick one of: ${EFFORT_LEVELS.join(', ')}, default.`
+  saveState()
+  const target = state.effortOverrides[channelId]
+  let note = 'Applies from the next wake.'
+  const running = state.spawned[channelId]
+  if (running && pidAlive(running.pid)) {
+    try {
+      await restartOne(channelId, running)
+      note = 'Background session restarted with it, conversation kept.'
+    } catch (err) {
+      note = `⚠️ Restart failed (${err.message}), applies on next wake.`
+    }
+  }
+  return `Effort for #${channelName}: ${target ? `\`${target}\`` : 'account default'}. ${note}`
+}
+
+// One click instead of a command. The panel is a plain message with buttons,
+// posted by /panel and pinnable, so the common actions never need typing.
+const PANEL_MARK = 'Panneau du salon'
+
+function panelMessage() {
+  const row1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('panel:plan').setLabel('Plan').setEmoji('🗺️').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('panel:continue').setLabel('Continue').setEmoji('▶️').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('panel:kill').setLabel('Stop').setEmoji('🛑').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId('panel:restart').setLabel('Restart').setEmoji('🔄').setStyle(ButtonStyle.Secondary),
+  )
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('panel:open').setLabel('Show terminal').setEmoji('👁️').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('panel:hide').setLabel('Hide terminal').setEmoji('🙈').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('panel:status').setLabel('Status').setEmoji('📊').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('panel:usage').setLabel('Usage').setEmoji('📈').setStyle(ButtonStyle.Secondary),
+  )
+  return { content: `**${PANEL_MARK}**. Un clic vaut une commande.`, components: [row1, row2] }
+}
+
+// Post the panel once per channel and pin it, so the buttons are always one
+// click away instead of living in a message that scrolls off.
+const PANEL_VERSION = 2
+
+async function ensurePanel(channel) {
+  state.panelPinned = state.panelPinned ?? {}
+  const known = state.panelPinned[channel.id]
+  if (known) {
+    // Labels change, the pinned message should not be left stale.
+    if (known.v === PANEL_VERSION) return false
+    try {
+      const msg = await channel.messages.fetch(known.id)
+      await msg.edit(panelMessage())
+      state.panelPinned[channel.id] = { id: known.id, v: PANEL_VERSION }
+      saveState()
+      return false
+    } catch {
+      delete state.panelPinned[channel.id]
+    }
+  }
+  try {
+    const pins = await channel.messages.fetchPinned().catch(() => null)
+    const existing = pins?.find(m => m.author.id === client.user.id && m.content.includes(PANEL_MARK))
+    if (existing) {
+      await existing.edit(panelMessage()).catch(() => {})
+      state.panelPinned[channel.id] = { id: existing.id, v: PANEL_VERSION }
+      saveState()
+      return false
+    }
+    const sent = await channel.send(panelMessage())
+    await sent.pin().catch(err => log(`panel pin failed in #${channel.name}: ${err.message ?? err}`))
+    state.panelPinned[channel.id] = { id: sent.id, v: PANEL_VERSION }
+    saveState()
+    log(`panel posted in #${channel.name}`)
+    return true
+  } catch (err) {
+    log(`panel failed in #${channel.name}: ${err.message ?? err}`)
+    return false
+  }
+}
+
+// One shot at startup: every text channel of the guild gets its panel.
+async function ensureAllPanels() {
+  if (!routing.guildId) return
+  try {
+    const guild = await client.guilds.fetch(routing.guildId)
+    const chans = await guild.channels.fetch()
+    for (const c of chans.values()) {
+      if (!c || typeof c.send !== 'function') continue
+      if (controlChannel && c.id === controlChannel.id) continue
+      await ensurePanel(c)
+    }
+  } catch (err) {
+    log(`panel sweep failed: ${err.message ?? err}`)
+  }
 }
 
 // Show/hide the hidden console window of a background session (Windows).
@@ -1170,6 +1291,7 @@ async function maybePostHelp(channel, channelId) {
   if (state.helpPosted[channelId]) return
   state.helpPosted[channelId] = true
   saveState()
+  void ensurePanel(channel)
   try {
     const recent = await channel.messages.fetch({ limit: 6 })
     const humanish = [...recent.values()].filter(m => !m.system)
@@ -1283,6 +1405,7 @@ setInterval(() => {
     // you. Killing it made the Allow button answer a session that no longer
     // existed. Held for AWAIT_MAX_MS, after that an abandoned prompt is not a
     // reason to keep a session forever.
+    if (s.keepAlive) continue
     const waiting = awaitingSince(cid)
     if (waiting && Date.now() - waiting < AWAIT_MAX_MS) continue
     if (Date.now() - s.lastActivity > idleMs) {
@@ -1293,6 +1416,98 @@ setInterval(() => {
     }
   }
 }, 60_000)
+
+// ── wake requests + concierge ───────────────────────────────────────────────
+// Anything on this machine can ask for a session: wake.mjs drops a file in
+// requests/ and the watcher spawns it. That is how the concierge session (the
+// one Ashraf reaches from the Claude app, no terminal open) hands him a real
+// project session.
+const concierge = { enabled: true, dir: join(HOME, 'claude-concierge'), channel: 'concierge', ...(config.concierge ?? {}) }
+
+async function serveWakeRequests() {
+  let files = []
+  try {
+    files = readdirSync(REQ_DIR).filter(f => f.endsWith('.json'))
+  } catch {
+    return
+  }
+  for (const f of files) {
+    const p = join(REQ_DIR, f)
+    const req = readJson(p, null)
+    try {
+      rmSync(p, { force: true })
+    } catch {}
+    const target = String(req?.target ?? '').trim()
+    if (!target) continue
+    // A path spawns there, a name resolves through the session index like a
+    // Discord channel would.
+    const asPath = extractPath(target) ?? (existsSync(target) ? target : null)
+    const name = asPath ? basename(canonPath(asPath)) : slugify(target.replace(/^#/, ''))
+    const chan = client.channels?.cache?.find(c => c?.name === name)
+    const channelId = chan?.id ?? `local:${name}`
+    if (state.spawned[channelId] && pidAlive(state.spawned[channelId].pid)) {
+      log(`wake request for ${name}: already running`)
+      continue
+    }
+    indexSessions()
+    const sess = asPath ? null : findSessionByName(name)
+    const cwd = canonPath(asPath ?? sess?.cwd ?? config.defaultDir ?? HOME)
+    if (!isTrusted(cwd)) {
+      log(`wake request for ${name}: ${cwd} is not trusted, skipped`)
+      continue
+    }
+    try {
+      const pid = await spawnClaude(cwd, name, sess?.sessionId ?? null, modelForWake(channelId, name), state.effortOverrides?.[channelId])
+      state.spawned[channelId] = {
+        pid,
+        channelName: name,
+        cwd,
+        sessionId: sess?.sessionId ?? null,
+        spawnedAt: Date.now(),
+        lastActivity: Date.now(),
+      }
+      saveState()
+      log(`wake request served: ${name} in ${cwd} (pid ${pid})`)
+    } catch (err) {
+      log(`wake request for ${name} failed: ${err.message ?? err}`)
+    }
+  }
+}
+setInterval(() => void serveWakeRequests(), 3000).unref?.()
+
+// The concierge is never reaped and is restarted when it dies: it is the door
+// Ashraf knocks on from the app, so it has to be there.
+const CONCIERGE_KEY = 'concierge'
+
+async function ensureConcierge() {
+  if (!concierge.enabled) return
+  const cur = state.spawned[CONCIERGE_KEY]
+  if (cur && pidAlive(cur.pid)) return
+  const cwd = canonPath(concierge.dir)
+  if (!isTrusted(cwd)) {
+    log(`concierge: ${cwd} is not trusted, open it once in a terminal`)
+    return
+  }
+  indexSessions()
+  const sess = findSessionByName(concierge.channel)
+  try {
+    const pid = await spawnClaude(cwd, concierge.channel, sess?.sessionId ?? null, null, null)
+    state.spawned[CONCIERGE_KEY] = {
+      pid,
+      channelName: concierge.channel,
+      cwd,
+      sessionId: sess?.sessionId ?? null,
+      spawnedAt: Date.now(),
+      lastActivity: Date.now(),
+      keepAlive: true,
+    }
+    saveState()
+    log(`concierge up in ${cwd} (pid ${pid})`)
+  } catch (err) {
+    log(`concierge spawn failed: ${err.message ?? err}`)
+  }
+}
+setInterval(() => void ensureConcierge(), 60_000).unref?.()
 
 // ── sessions stalled on an API error ────────────────────────────────────────
 // A 529 from the API ends the turn with an "API Error: ..." line in the
@@ -1739,6 +1954,43 @@ client.on('interactionCreate', async i => {
       return
     }
 
+    // Panel buttons: same actions as the slash commands, one click away.
+    if (i.isButton?.() && i.customId.startsWith('panel:')) {
+      if (!allowFrom.includes(i.user.id)) {
+        await i.reply({ content: 'Not allowed.', ephemeral: true })
+        return
+      }
+      const ch = i.channel
+      const isThread = typeof ch?.isThread === 'function' && ch.isThread()
+      const channelId = isThread ? (ch.parentId ?? i.channelId) : i.channelId
+      const channelName = (isThread ? ch.parent?.name : ch?.name) ?? ''
+      const action = i.customId.slice('panel:'.length)
+      await i.deferReply()
+      try {
+        if (action === 'status') await i.editReply(await statusText())
+        else if (action === 'sessions') await i.editReply(sessionsText())
+        else if (action === 'usage') await i.editReply(await usageText())
+        else if (action === 'open') await i.editReply(await openText(channelName, 'show'))
+        else if (action === 'hide') await i.editReply(await openText(channelName, 'hide'))
+        else if (action === 'restart') await i.editReply(await restartText(channelName))
+        else if (action === 'kill') await i.editReply(await killOneText(channelName))
+        else if (action === 'continue') {
+          writeCommandFile(channelId, 'Continue where you left off.', i.user)
+          await i.editReply('▶️ Continue envoyé.')
+        } else if (action === 'plan') {
+          writeCommandFile(
+            channelId,
+            'Plan mode: research the task and post the plan for approval with ask_user (buttons). Change nothing until I approve.',
+            i.user,
+          )
+          await i.editReply('🗺️ Mode plan demandé, le plan arrivera avec des boutons.')
+        } else await i.editReply('Unknown button.')
+      } catch (err) {
+        await i.editReply(`⚠️ ${err.message ?? err}`)
+      }
+      return
+    }
+
     if (i.isChatInputCommand()) {
       if (!allowFrom.includes(i.user.id)) {
         await i.reply({ content: 'Not allowed.', ephemeral: true })
@@ -1815,6 +2067,23 @@ client.on('interactionCreate', async i => {
           }
           return
         }
+        case 'effort': {
+          await i.deferReply()
+          const ch = i.channel
+          const isThread = typeof ch?.isThread === 'function' && ch.isThread()
+          const channelId = isThread ? (ch.parentId ?? i.channelId) : i.channelId
+          const channelName = isThread ? ch.parent?.name : ch?.name
+          if (!channelName) {
+            await i.editReply('Could not resolve this channel.')
+            return
+          }
+          await i.editReply(await effortText(channelName, channelId, i.options.getString('set') ?? null))
+          return
+        }
+        case 'panel': {
+          await i.reply(panelMessage())
+          return
+        }
         case 'model': {
           await i.deferReply()
           const ch = i.channel
@@ -1859,6 +2128,8 @@ client.on('guildCreate', async guild => {
 client.once('ready', c => {
   log(`watcher connected as ${c.user.tag} (pid ${process.pid}, machine ${MACHINE}, idle ${config.idleMinutes}min, default ${config.defaultDir})`)
   void setupControl()
+  void ensureAllPanels()
+  void ensureConcierge()
   // Slash commands — guild-scoped registration is instant (global takes up
   // to an hour). type 3 = STRING option.
   if (routing.guildId) {
@@ -1914,6 +2185,26 @@ client.once('ready', c => {
               { type: 3, name: 'name', description: 'New display name (1-32 chars)', required: true },
             ],
           },
+          {
+            name: 'effort',
+            description: "Show or switch this channel's effort level",
+            options: [
+              {
+                type: 3,
+                name: 'set',
+                description: 'Leave empty to just show the current level',
+                required: false,
+                choices: [
+                  { name: 'low', value: 'low' },
+                  { name: 'medium', value: 'medium' },
+                  { name: 'high', value: 'high' },
+                  { name: 'xhigh (max)', value: 'xhigh' },
+                  { name: 'account default', value: 'default' },
+                ],
+              },
+            ],
+          },
+          { name: 'panel', description: 'Post the button panel for this channel' },
           {
             name: 'model',
             description: "Show or switch this channel's model",

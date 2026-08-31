@@ -1,21 +1,22 @@
 {
   "idleMinutes": 30,
   "defaultDir": "C:\\Users\\ashra",
-
   "//machine": "Label for this PC in the Discord control channel. Defaults to the hostname, purely cosmetic: identity comes from hostname + home + platform, so two machines may share a name.",
   "machine": "desktop",
-
   "//machineId": "Only needed if two machines share the same hostname AND the same user folder. By default the id is derived from hostname + home + platform.",
-
   "//controlChannel": "Channel the watchers use to see each other (created on first run). Default: claude-watchers.",
   "controlChannel": "claude-watchers",
-
   "//multiMachine": "Set to false to skip the control channel entirely and always wake locally.",
   "multiMachine": true,
-
   "//channels": "Optional: pin a channel to one machine. Everything else is decided automatically (the machine that has the session on disk wakes it).",
   "channels": {
     "library-ssr": "desktop",
     "server-logs": "laptop"
+  },
+  "//concierge": "Always-on hidden session reachable from the Claude app (Remote Control). It wakes the real sessions with wake.mjs and is never reaped.",
+  "concierge": {
+    "enabled": true,
+    "dir": "C:/Users/you/claude-concierge",
+    "channel": "concierge"
   }
 }
